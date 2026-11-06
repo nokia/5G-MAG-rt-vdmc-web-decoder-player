@@ -1,0 +1,33 @@
+.*/
+# .github/ holds local agent configuration; only the repository banner is published
+!.github/
+.github/*
+!.github/banner.svg
+browser-console.log
+*.exe
+
+# tm-reference ships only the decoder patch; everything else (reference
+# sources, dependencies, build trees, binaries) is obtained/built locally.
+tm-reference/*
+!tm-reference/wasm_decoder.patch
+
+# source sequences for the verification encoder (not redistributed)
+input/
+
+# verification test outputs
+verification/runs/
+verification/work/
+verification/node_modules/
+verification/parity/data/*/sample-app/
+
+# one-off calibration/probe tooling kept locally (see docs/DISPLACEMENT-CALIBRATION.md §9)
+verification/helpers/
+
+# written by run-verification.mjs, served, then deleted (kept only with --keep)
+verification/_sdk-decode-page.html
+
+# SDK build dependencies (esbuild + three), installed on demand for `npm run build`
+sdk/node_modules/
+
+# diagnostic capture screenshots (regenerated on demand)
+verify/screens/

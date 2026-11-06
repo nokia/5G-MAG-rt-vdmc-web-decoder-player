@@ -1,0 +1,1632 @@
+© 2026 Nokia
+
+Licensed under the 5G-MAG Public License (v1.0)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f6668585..4fa9a69a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,6 +10,8 @@ OPTION( USE_HM_VIDEO_CODEC        "Use HM video encoder and decoder"
+ OPTION( USE_VTM_VIDEO_CODEC       "Use VTM video encoder and decoder"                     FALSE  ) 
+ OPTION( USE_VV_VIDEO_CODEC        "Use VVENC and VVDEC video encoder and decoder"         FALSE  ) 
+ OPTION( USE_SHMAPP_VIDEO_CODEC    "Use SHM video encoder and decoder" 		 			  FALSE  )
++OPTION( USE_WEB_VIDEO_CODEC      "Use WebCodecs for video encoding (browser-only)"       FALSE  )
++OPTION( USE_WEB_VIDEO_DECODER    "Use WebCodecs for video decoding (browser-only)"       FALSE  )
+ 
+ # Geometry encoder and decoder:       
+ OPTION( USE_DRACO_GEOMETRY_CODEC  "Use draco geometry encoder and decoder"                FALSE  )
+@@ -56,7 +58,7 @@ endif()
+ 
+ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_XM_NO_INTRINSICS_")
+ # compile flags still to be harmonized to guarantee strict same compilation results on float operations
+-if (NOT WIN32)
++if (NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+       set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -m64 -DNDEBUG -mfpmath=sse -ffp-contract=off -stdlib=libc++ \
+         -ffp-model=strict ") # -Wno-unknown-warning-option
+@@ -88,6 +90,43 @@ endif()
+ if( ${USE_JOINT_CODING} )
+   add_compile_definitions(USE_JOINT_CODING)
+ endif()
++
++# Emscripten/WASM early configuration (defines must be set before libraries are built)
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  message(STATUS "=== Configuring for Emscripten/WASM ===")
++  
++  # Define WASM_BUILD for conditional compilation
++  add_compile_definitions(WASM_BUILD)
++  
++  # Use float mesh type for WASM (smaller memory footprint)
++  set(MESH_TYPE "float" CACHE STRING "" FORCE)
++  
++  # Disable desktop video codecs for WASM (will use WebCodecs in JS)
++  set(USE_HM_VIDEO_CODEC OFF CACHE BOOL "" FORCE)
++  set(USE_VTM_VIDEO_CODEC OFF CACHE BOOL "" FORCE)
++  set(USE_VV_VIDEO_CODEC OFF CACHE BOOL "" FORCE)
++  set(USE_DRACO_GEOMETRY_CODEC OFF CACHE BOOL "" FORCE)
++  
++  # Enable WebCodecs for video encoding/decoding in WASM
++  set(USE_WEB_VIDEO_CODEC ON CACHE BOOL "" FORCE)
++  set(USE_WEB_VIDEO_DECODER ON CACHE BOOL "" FORCE)
++  add_compile_definitions(USE_WEB_VIDEO_CODEC)
++  add_compile_definitions(USE_WEB_VIDEO_DECODER)
++  
++  # =====================================================================
++  # FAST-LINK OPTIMIZATION: Compile with -O2, link with -O0
++  # See: https://github.com/emscripten-core/emscripten/issues/26455
++  #   Binaryen/wasm-opt runs at link time with -O1 and above, causing
++  #   link times of tens of minutes. At -O0 it is skipped entirely.
++  #   We compile each .o file with -O2 (good codegen, cached), then link
++  #   with -O0 (instant link). ASYNCIFY is kept because it is required.
++  # =====================================================================
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -include sys/types.h")
++  set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -O2 -include sys/types.h")
++  
++  # Disable LTO (extremely slow in Emscripten)
++  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
++endif()
+ # Tools
+ include( dependencies/cmake/tools/CPM.cmake )
+ include( dependencies/cmake/tools/tools.cmake )
+@@ -95,18 +134,57 @@ include( dependencies/cmake/tools/clang-format.cmake )
+ include( dependencies/cmake/tools/cppcheck.cmake )
+ 
+ # Dependencies
+-include( dependencies/cmake/geometry/directx.cmake )
+-include( dependencies/cmake/geometry/uvatlas.cmake )
+-include( dependencies/cmake/geometry/mmetric.cmake )
+-include( dependencies/cmake/geometry/tinyply.cmake )
+-
+-# Wrapper libraries
+-include( dependencies/cmake/video/hdrtools.cmake )
+-include( dependencies/cmake/video/hm.cmake )
+-include( dependencies/cmake/video/vtm.cmake )
+-include( dependencies/cmake/video/vvlib.cmake )
+-include( dependencies/cmake/geometry/draco.cmake )
+-include( dependencies/cmake/video/shm_app.cmake )
++# DirectX is not needed for Emscripten.
++# mmetric and tinyply ARE needed for Emscripten, but only for their header
++# sources (glm, stb_image, mmModel.h, tinyply.h). We must NOT build the mmetric
++# library under Emscripten because it depends on OpenGL/glfw/glad, so we fetch
++# its sources download-only instead of running its full CMake.
++option(USE_UVATLAS "Enable UVAtlas texture parametrization" OFF)
++if(USE_UVATLAS)
++  add_compile_definitions(USE_UVATLAS)
++endif()
++
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  if(USE_UVATLAS)
++    include( dependencies/cmake/geometry/directx.cmake )
++    include( dependencies/cmake/geometry/uvatlas.cmake )
++  endif()
++  include( dependencies/cmake/geometry/mmetric.cmake )
++  include( dependencies/cmake/geometry/tinyply.cmake )
++else()
++  # Emscripten/WASM: download-only the mmetric sources (headers + vendored glm,
++  # stb_image, mmModel.h) without adding it as a build subdirectory.
++  set( MMETRIC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/dependencies/mmetric )
++  if( NOT EXISTS ${MMETRIC_DIR} )
++    CPMAddPackage( NAME             mmetric
++                   GIT_REPOSITORY    https://git.mpeg.expert/MPEG/3dgh/v-pcc/software/mpeg-pcc-mmetric.git
++                   GIT_TAG           1_1_7
++                   SOURCE_DIR        ${MMETRIC_DIR}
++                   DOWNLOAD_ONLY     YES )
++  endif()
++  # mmetric normally fetches dmetric from its own CMake, but DOWNLOAD_ONLY skips
++  # that. metrics.hpp needs dmetric/source/pcc_processing.hpp, so fetch it too.
++  set( DMETRIC_DIR ${MMETRIC_DIR}/dependencies/dmetric )
++  if( NOT EXISTS ${DMETRIC_DIR} )
++    CPMAddPackage( NAME             dmetric
++                   GIT_REPOSITORY    https://git.mpeg.expert/MPEG/3dgh/v-pcc/software/mpeg-pcc-dmetric.git
++                   GIT_TAG           release-v0.14.2
++                   SOURCE_DIR        ${DMETRIC_DIR}
++                   DOWNLOAD_ONLY     YES )
++  endif()
++  # tinyply.cmake is already download-only and safe under Emscripten.
++  include( dependencies/cmake/geometry/tinyply.cmake )
++endif()
++
++# Wrapper libraries (skip for Emscripten - will use WebCodecs in JS)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  include( dependencies/cmake/video/hdrtools.cmake )
++  include( dependencies/cmake/video/hm.cmake )
++  include( dependencies/cmake/video/vtm.cmake )
++  include( dependencies/cmake/video/vvlib.cmake )
++  include( dependencies/cmake/geometry/draco.cmake )
++  include( dependencies/cmake/video/shm_app.cmake )
++endif()
+ 
+ # vmesh core codec
+ add_all_subdirectory(source/wrapper)
+@@ -115,4 +193,47 @@ add_all_subdirectory(source/lib)
+ # Applications
+ add_subdirectory(source/app)
+ 
++# Emscripten/WASM linker configuration (applied after targets are created)
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  # =====================================================================
++  # FAST-LINK: -O0 at link time skips Binaryen (wasm-opt), saving minutes.
++  #   Compile is done at -O2 via CMAKE_CXX_FLAGS (above).
++  #   ASYNCIFY is required for the decoder to call JS callbacks from C++.
++  # =====================================================================
++  set(WASM_LINK_FLAGS
++    "-s MODULARIZE=1"
++    "-s EXPORT_ES6=1"
++    "-s EXPORT_NAME='createVDMC'"
++    "-s WASM=1"
++    "-s ALLOW_MEMORY_GROWTH=1"
++    "-s INITIAL_HEAP=256MB"
++    "-s NO_EXIT_RUNTIME=1"
++    "-s FORCE_FILESYSTEM=1"
++    "-s EXPORTED_RUNTIME_METHODS=['FS','callMain','ccall','cwrap','HEAPU8','HEAPF32','HEAPU32']"
++    "-s ASYNCIFY"
++    "-s ENVIRONMENT=web,worker"
++    "-O0"
++  )
++  string(REPLACE ";" " " WASM_LINK_FLAGS_STR "${WASM_LINK_FLAGS}")
++  
++  # Apply to encode target
++  if(TARGET encode)
++    set_target_properties(encode PROPERTIES
++      SUFFIX ".js"
++      LINK_FLAGS "${WASM_LINK_FLAGS_STR} -s EXPORT_NAME='vdmc_encoder'"
++    )
++  endif()
++  
++  # Apply to decode target
++  if(TARGET decode)
++    set_target_properties(decode PROPERTIES
++      SUFFIX ".js"
++      LINK_FLAGS "${WASM_LINK_FLAGS_STR} -s EXPORT_NAME='vdmc_decoder'"
++    )
++  endif()
++  
++  message(STATUS "WASM targets configured: encode.js, decode.js")
++  message(STATUS "Fast-link enabled: compile=-O2, link=-O0 (skips Binaryen)")
++endif()
++
+ 
+diff --git a/dependencies/program-options-lite/program_options_lite.h b/dependencies/program-options-lite/program_options_lite.h
+index 6e01c885..59cd74b2 100644
+--- a/dependencies/program-options-lite/program_options_lite.h
++++ b/dependencies/program-options-lite/program_options_lite.h
+@@ -97,8 +97,15 @@ namespace program_options_lite {
+   template<typename T>
+   inline void parse_into(T& dest, const std::string& src) {
+     std::istringstream src_ss(src, std::istringstream::in);
++#ifndef WASM_BUILD
+     src_ss.exceptions(std::ios::failbit);
++#endif
+     src_ss >> dest;
++#ifdef WASM_BUILD
++    if (src_ss.fail()) {
++      std::cerr << "[WASM] parse_into failed for: \"" << src << "\"\n";
++    }
++#endif
+   }
+ 
+   /** OptionBase: Virtual base class for storing information relating to a
+diff --git a/source/app/CMakeLists.txt b/source/app/CMakeLists.txt
+index 0ad36f0a..51c456c1 100644
+--- a/source/app/CMakeLists.txt
++++ b/source/app/CMakeLists.txt
+@@ -5,10 +5,16 @@ target_include_directories(po INTERFACE "${PROJECT_SOURCE_DIR}/dependencies/" )
+ 
+ ########################### Main applications ###########################
+ 
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR NOT USE_UVATLAS)
++  set(ENCODE_EXTRA_LIBS "")
++else()
++  set(ENCODE_EXTRA_LIBS UVAtlas DirectX-Headers DirectXMath DirectXMesh)
++endif()
++
+ # Encode
+ create_executable( NAME      encode 
+                    SOURCES encodeApp.cpp
+-                   LIBRARIES po vmeshCommon vmeshEncoder v3cBitstream UVAtlas DirectX-Headers DirectXMath DirectXMesh 
++                   LIBRARIES po vmeshCommon vmeshEncoder v3cBitstream ${ENCODE_EXTRA_LIBS} 
+                    INCLUDES  ${CMAKE_SOURCE_DIR}/source/lib/v3cBitstream
+                              ${CMAKE_SOURCE_DIR}/source/lib/v3cBitstream/syntaxElements
+                              ${CMAKE_SOURCE_DIR}/source/lib/vmeshCommon
+@@ -43,7 +49,7 @@ create_executable( NAME      metrics
+ # Test BaseMesh Encoder
+ create_executable( NAME      baseMeshEncodeApp
+         SOURCES wrapper/baseMeshEncodeApp.cpp
+-        LIBRARIES po vmeshCommon vmeshEncoder  UVAtlas DirectX-Headers DirectXMath DirectXMesh
++        LIBRARIES po vmeshCommon vmeshEncoder ${ENCODE_EXTRA_LIBS}
+         INCLUDES  ${CMAKE_SOURCE_DIR}/source/lib/v3cBitstream
+         ${CMAKE_SOURCE_DIR}/source/lib/v3cBitstream/syntaxElements
+         ${CMAKE_SOURCE_DIR}/source/lib/vmeshCommon
+@@ -210,10 +216,7 @@ if( BUILD_UNIT_TEST_APPS )
+                                videoEncoder 
+                                videoDecoder 
+                                colourConverter
+-                               UVAtlas 
+-                               DirectX-Headers 
+-                               DirectXMath 
+-                               DirectXMesh
++                               ${ENCODE_EXTRA_LIBS}
+                      INCLUDES  ${CMAKE_SOURCE_DIR}/dependencies
+                                ${CMAKE_SOURCE_DIR}/source/lib/vmeshCommon
+                                ${CMAKE_SOURCE_DIR}/source/lib/vmeshEncoder 
+diff --git a/source/app/decode.cpp b/source/app/decode.cpp
+index 889a1922..ce2a0878 100644
+--- a/source/app/decode.cpp
++++ b/source/app/decode.cpp
+@@ -57,6 +57,8 @@ struct Parameters {
+   std::string                 decodedMaterialLibPath = {};
+   std::string                 sourceMeshPath         = {};
+   std::string                 sourceTexturePath      = {};
++  int32_t                     decodedUvTransform     = 0;
++  bool                        flipDecodedTextureV    = false;
+   int32_t                     startFrame             = 0;
+   int32_t                     frameCount             = 0;
+   double                      framerate              = 30.;
+@@ -69,6 +71,60 @@ struct Parameters {
+ #endif
+ };
+ 
++static void
++flipDecodedTexturesVertically(vmesh::Sequence& reconstruct) {
++  for (auto& attribute : reconstruct.attributes()) {
++    for (int32_t frameIdx = 0; frameIdx < attribute.frameCount(); ++frameIdx) {
++      auto& frame = attribute.frame(frameIdx);
++      for (int32_t planeIdx = 0; planeIdx < frame.planeCount(); ++planeIdx) {
++        auto& plane = frame.plane(planeIdx);
++        const int32_t h = plane.height();
++        const int32_t w = plane.width();
++        for (int32_t y = 0; y < (h >> 1); ++y) {
++          const int32_t yOpp = h - 1 - y;
++          for (int32_t x = 0; x < w; ++x) {
++            const auto tmp = plane(y, x);
++            plane(y, x)    = plane(yOpp, x);
++            plane(yOpp, x) = tmp;
++          }
++        }
++      }
++    }
++  }
++}
++
++static void
++mirrorDecodedUvsHorizontally(vmesh::Sequence& reconstruct) {
++  for (auto& mesh : reconstruct.meshes()) {
++    const auto texCoordCount = mesh.texCoordCount();
++    for (int32_t i = 0; i < texCoordCount; ++i) {
++      auto uv = mesh.texCoord(i);
++      uv[0] = 1.0 - uv[0];
++      mesh.setTexCoord(i, uv);
++    }
++  }
++}
++
++static void
++applyDecodedUvTransform(vmesh::Sequence& reconstruct, int32_t transformMode) {
++  for (auto& mesh : reconstruct.meshes()) {
++    const auto texCoordCount = mesh.texCoordCount();
++    for (int32_t i = 0; i < texCoordCount; ++i) {
++      auto uv = mesh.texCoord(i);
++      switch (transformMode) {
++      case 1: uv[0] = 1.0 - uv[0]; break;                    // mirror U
++      case 2: uv[1] = 1.0 - uv[1]; break;                    // mirror V
++      case 3:
++        uv[0] = 1.0 - uv[0];
++        uv[1] = 1.0 - uv[1];
++        break;                                               // mirror UV
++      default: break;                                        // none
++      }
++      mesh.setTexCoord(i, uv);
++    }
++  }
++}
++
+ //============================================================================
+ 
+ static bool
+@@ -118,6 +174,14 @@ parseParameters(int argc, char* argv[], Parameters& params) try {
+       params.decodedMaterialLibPath,  
+       params.decodedMaterialLibPath, 
+       "Decoded materials")
++    ("decUvTransform",
++      params.decodedUvTransform,
++      params.decodedUvTransform,
++      "Decoded UV transform: 0 none, 1 mirrorU, 2 mirrorV, 3 mirrorUV")
++    ("decFlipTexV",
++      params.flipDecodedTextureV,
++      params.flipDecodedTextureV,
++      "Flip decoded texture image vertically before save")
+     ("dequantizeUV",
+       decParams.dequantizeUV, 
+       decParams.dequantizeUV,
+@@ -408,9 +472,22 @@ decompress(const Parameters& params) {
+     decoder.getHighLevelSyntaxLog(syntax);
+ #endif
+     // Save reconstructed models
++    auto decodedTexturePath     = params.decodedTexturePath;
++    auto decodedMaterialLibPath = params.decodedMaterialLibPath;
++    if (decodedTexturePath.empty() && !reconstruct.attributes().empty()) {
++      const auto meshBase = vmesh::removeExtension(params.decodedMeshPath);
++      decodedTexturePath = meshBase + ".png";
++      if (decodedMaterialLibPath.empty()) { decodedMaterialLibPath = meshBase + ".mtl"; }
++      std::cout << "Info: decTex not provided, writing textures to "
++                << decodedTexturePath << "\n";
++    }
++    if (params.flipDecodedTextureV && !reconstruct.attributes().empty()) {
++      flipDecodedTexturesVertically(reconstruct);
++    }
++    applyDecodedUvTransform(reconstruct, params.decodedUvTransform);
+     if (!reconstruct.save(params.decodedMeshPath,
+-                          params.decodedTexturePath,
+-                          params.decodedMaterialLibPath,
++                          decodedTexturePath,
++                          decodedMaterialLibPath,
+                           params.startFrame + totalDecodedFrameCount)) {
+       std::cerr << "Error: can't save decoded sequence \n";
+       return false;
+diff --git a/source/lib/atlasDecoder/atlasDecoder.cpp b/source/lib/atlasDecoder/atlasDecoder.cpp
+index 887736f0..ef0cb8a3 100644
+--- a/source/lib/atlasDecoder/atlasDecoder.cpp
++++ b/source/lib/atlasDecoder/atlasDecoder.cpp
+@@ -220,18 +220,24 @@ AtlasDataDecoder::decodeLiftingTransformParameters(
+     // trParam.updateWeight_[l] = 0
+   } else {
+     trParam.valenceUpdateWeightFlag_ = ltp.getValenceUpdateWeightFlag();
++    int updateCount = (int)std::min((size_t)subdivIterationCount,
++                                    ltp.getLiftingUpdateWeightNumerator().size());
+     for (int l = 0; l < subdivIterationCount; l++) {
+       if ((ltp.getAdaptiveUpdateWeightFlag() == 1) || (l == 0)) {
+-        trParam.updateWeight_[l] =
+-          (double)ltp.getLiftingUpdateWeightNumerator()[l]
+-          / (double)(ltp.getLiftingUpdateWeightDenominatorMinus1()[l] + 1);
++        if (l < updateCount) {
++          trParam.updateWeight_[l] =
++            (double)ltp.getLiftingUpdateWeightNumerator()[l]
++            / (double)(ltp.getLiftingUpdateWeightDenominatorMinus1()[l] + 1);
++        }
+       } else {
+         trParam.updateWeight_[l] = trParam.updateWeight_[0];
+       }
+     }
+   }
+ 
+-  for (int l = 0; l < subdivIterationCount; l++) {
++  int predCount = (int)std::min((size_t)subdivIterationCount,
++                                 ltp.getLiftingPredictionWeightNumerator().size());
++  for (int l = 0; l < predCount; l++) {
+     trParam.predWeight_[l] =
+       (double)ltp.getLiftingPredictionWeightNumerator()[l]
+       / (double)(ltp.getLiftingPredictionWeightDenominatorMinus1()[l] + 1);
+@@ -384,6 +390,8 @@ AtlasDataDecoder::decompressAtlasPatch(
+   int32_t                  tileIndex,
+   AtlasTileLayerRbsp&      atl,
+   std::vector<AtlasTile>&    referenceFrameList) {  //frameCount
++  printf("DBG: decompressAtlasPatch entered atlPos=%u frameIndex=%d tileIndex=%d\n",
++         atlPos, frameIndex, tileIndex); fflush(stdout);
+   fflush(stdout);
+   int32_t  atlasId             = adStream.getAtlasId();
+   auto&    ath                 = atl.getHeader();
+@@ -1348,15 +1356,24 @@ AtlasDataDecoder::decodeAtlasDataSubbitstream(AtlasBitstream& adStream,
+     createAthReferenceList(
+       asps, atList[atlIdx], atList[atlIdx].getHeader().getReferenceList());
+     auto tileIndex = 0;
++    printf("DBG: tileType=%d maxTileCount=%d atlasFrameCount=%d frameIndexCalc=%d\n",
++           (int)atList[atlIdx].getHeader().getType(),
++           (int)decodedTiles_.size(),
++           (int)(decodedTiles_.empty() ? -1 : (int)decodedTiles_[0].size()),
++           (int)frameIndexCalc);
++    fflush(stdout);
+     std::cout << "atList[atlIdx].getHeader().getType() "
+-              << atList[atlIdx].getHeader().getType() << "/n";
++              << atList[atlIdx].getHeader().getType() << "/n" << std::endl;
+     if (atList[atlIdx].getHeader().getType() == I_TILE
+         || atList[atlIdx].getHeader().getType() == P_TILE
+         || atList[atlIdx].getHeader().getType() == SKIP_TILE) {
++      printf("DBG: getTileIndex...\n"); fflush(stdout);
+       tileIndex = afps.getAtlasFrameTileInformation().getTileIndex(
+         atList[atlIdx].getHeader().getAtlasTileHeaderId());
++      printf("DBG: tileIndex=%d\n", tileIndex); fflush(stdout);
+       decodedTiles_[tileIndex][frameIndexCalc].tileType_ =
+         atList[atlIdx].getHeader().getType();
++      printf("DBG: tileType set\n"); fflush(stdout);
+       decodedTiles_[tileIndex][frameIndexCalc].tileId_ =
+         atList[atlIdx].getHeader().getAtlasTileHeaderId();
+       decodedTiles_[tileIndex][frameIndexCalc].tileAfpsId_ =
+@@ -1364,6 +1381,7 @@ AtlasDataDecoder::decodeAtlasDataSubbitstream(AtlasBitstream& adStream,
+       decodedTiles_[tileIndex][frameIndexCalc].tileAspsId_ = aspsId;
+       decodedTiles_[tileIndex][frameIndexCalc].tileGeometryArea_ =
+         decodedGeometryTileAreas[tileIndex];
++      printf("DBG: tileGeometryArea set\n"); fflush(stdout);
+     } else if (atList[atlIdx].getHeader().getType() == I_TILE_ATTR
+                || atList[atlIdx].getHeader().getType() == P_TILE_ATTR
+                || atList[atlIdx].getHeader().getType() == SKIP_TILE_ATTR)
+@@ -1400,12 +1418,16 @@ AtlasDataDecoder::decodeAtlasDataSubbitstream(AtlasBitstream& adStream,
+         exit(0);
+     }
+ 
++    printf("DBG: calling decompressAtlasPatch atlIdx=%d tileIndex=%d frameIndexCalc=%d decodedTiles_[%d].size()=%d\n",
++           atlIdx, tileIndex, frameIndexCalc, tileIndex, (int)decodedTiles_[tileIndex].size());
++    fflush(stdout);
+     decompressAtlasPatch(atlIdx,
+                          adStream,
+                          frameIndexCalc,
+                          tileIndex,
+                          atList[atlIdx],
+                          decodedTiles_[tileIndex]);
++    printf("DBG: decompressAtlasPatch returned\n"); fflush(stdout);
+   }
+ }
+ 
+diff --git a/source/lib/basemeshBitstream/baseMeshCommon.hpp b/source/lib/basemeshBitstream/baseMeshCommon.hpp
+index dea13b74..7c729ebb 100644
+--- a/source/lib/basemeshBitstream/baseMeshCommon.hpp
++++ b/source/lib/basemeshBitstream/baseMeshCommon.hpp
+@@ -41,6 +41,7 @@
+ #include <memory>
+ #include <utility>
+ #include <vector>
++#include <sys/types.h>
+ #include <sys/stat.h>
+ 
+ #if defined(WIN32) || defined(_WIN32)
+diff --git a/source/lib/basemeshDecoder/CMakeLists.txt b/source/lib/basemeshDecoder/CMakeLists.txt
+index 9bd3d23d..e9501dde 100644
+--- a/source/lib/basemeshDecoder/CMakeLists.txt
++++ b/source/lib/basemeshDecoder/CMakeLists.txt
+@@ -14,10 +14,6 @@ include_directories( ${CMAKE_SOURCE_DIR}/dependencies/libmd5
+         ${CMAKE_SOURCE_DIR}/source/lib/bitstreamsCommon/syntaxElements
+         ${CMAKE_SOURCE_DIR}/source/wrapper/geometryDecoder
+         ${CMAKE_SOURCE_DIR}/dependencies
+-        ${CMAKE_SOURCE_DIR}/dependencies/uvatlas/UVAtlas/inc
+-        ${CMAKE_SOURCE_DIR}/dependencies/directx-math/Inc
+-        ${CMAKE_SOURCE_DIR}/dependencies/directx-mesh/DirectXMesh
+-        ${CMAKE_SOURCE_DIR}/dependencies/directx-headers/include
+         ${CMAKE_SOURCE_DIR}/dependencies/mmetric/source/lib/include
+         ${CMAKE_SOURCE_DIR}/dependencies/mmetric/dependencies/
+         ${CMAKE_SOURCE_DIR}/dependencies/mmetric/dependencies/glad/include
+diff --git a/source/lib/basemeshDecoder/baseMeshDecoder.cpp b/source/lib/basemeshDecoder/baseMeshDecoder.cpp
+index 0e39f478..f9bb324d 100644
+--- a/source/lib/basemeshDecoder/baseMeshDecoder.cpp
++++ b/source/lib/basemeshDecoder/baseMeshDecoder.cpp
+@@ -355,13 +355,12 @@ BaseMeshDecoder::decompressMotion(BaseMeshSubmeshLayer& bmsl,
+   for (int vindex = 0; vindex < refFrameInput.base.pointCount(); ++vindex) {
+     current.base.setPoint(
+       vindex,
+-      vmesh::Clip3(
+-        0.0, double(maxValue), reference[vindex][0] + motionVector[vindex][0]),
+-      vmesh::Clip3(
+-        0.0, double(maxValue), reference[vindex][1] + motionVector[vindex][1]),
+-      vmesh::Clip3(0.0,
+-            double(maxValue),
+-            reference[vindex][2] + motionVector[vindex][2]));
++      static_cast<MeshType>(vmesh::Clip3<double>(
++        0.0, static_cast<double>(maxValue), static_cast<double>(reference[vindex][0]) + static_cast<double>(motionVector[vindex][0]))),
++      static_cast<MeshType>(vmesh::Clip3<double>(
++        0.0, static_cast<double>(maxValue), static_cast<double>(reference[vindex][1]) + static_cast<double>(motionVector[vindex][1]))),
++      static_cast<MeshType>(vmesh::Clip3<double>(
++        0.0, static_cast<double>(maxValue), static_cast<double>(reference[vindex][2]) + static_cast<double>(motionVector[vindex][2]))));
+   }
+   return true;
+ }
+@@ -459,7 +458,7 @@ BaseMeshDecoder::decompressBaseMesh(
+     if (bitDepthPosition != qpPosition) {
+       const auto scalePosition =
+         ((1 << qpPosition) - 1.0) / ((1 << bitDepthPosition) - 1.0);
+-      const auto iscalePosition = 1.0 / scalePosition;
++      const MeshType iscalePosition = static_cast<MeshType>(1.0 / scalePosition);
+       for (int32_t v = 0, vcount = base.pointCount(); v < vcount; ++v) {
+         base.setPoint(v, base.point(v) * iscalePosition);
+       }
+@@ -494,7 +493,7 @@ BaseMeshDecoder::decompressBaseMesh(
+       if(bitDepthNormal != qpNormal){
+         const auto scaleNormal = ((1 << qpNormal) - 1.0)
+                                  / ((1 << bitDepthNormal) - 1.0);
+-        const auto iscaleNormal = 1.0 / scaleNormal;
++        const MeshType iscaleNormal = static_cast<MeshType>(1.0 / scaleNormal);
+         for (int32_t n = 0, ncount = base.normalCount(); n < ncount; ++n) {
+           base.setNormal(n, base.normal(n) * iscaleNormal);
+           }
+@@ -502,8 +501,8 @@ BaseMeshDecoder::decompressBaseMesh(
+     }
+     // Texture dequantization
+     if (base.texCoordCount() > 0) {
+-      const auto scaleTexCoord  = std::pow(2.0, qpTexCoord) - 1.0;
+-      const auto iscaleTexCoord = 1.0 / scaleTexCoord;
++      const MeshType scaleTexCoord  = static_cast<MeshType>(std::pow(2.0, qpTexCoord) - 1.0);
++      const MeshType iscaleTexCoord = static_cast<MeshType>(1.0 / static_cast<double>(scaleTexCoord));
+       for (int32_t tc = 0, tccount = base.texCoordCount(); tc < tccount;
+            ++tc) {
+         base.setTexCoord(tc, base.texCoord(tc) * iscaleTexCoord);
+@@ -511,8 +510,8 @@ BaseMeshDecoder::decompressBaseMesh(
+     }
+     // FaceID dequantization
+     if (base.faceIdCount() > 0) {
+-      const auto scaleFaceId  = std::pow(2.0, qpFaceId) - 1.0;
+-      const auto iscaleFaceId = 1.0 / scaleFaceId;
++      const MeshType scaleFaceId  = static_cast<MeshType>(std::pow(2.0, qpFaceId) - 1.0);
++      const MeshType iscaleFaceId = static_cast<MeshType>(1.0 / static_cast<double>(scaleFaceId));
+       for (int32_t tc = 0, tccount = base.faceIdCount(); tc < tccount; ++tc) {
+         base.setFaceId(tc, base.faceId(tc) * iscaleFaceId);
+       }
+diff --git a/source/lib/vmeshCommon/CMakeLists.txt b/source/lib/vmeshCommon/CMakeLists.txt
+index f0d9cd2d..73030ba1 100644
+--- a/source/lib/vmeshCommon/CMakeLists.txt
++++ b/source/lib/vmeshCommon/CMakeLists.txt
+@@ -26,6 +26,11 @@ add_custom_command( OUTPUT ${VERSION_FILE} DEPENDS genversion )
+ 
+ file(GLOB SRC *.cpp util/*.cpp util/*.hpp *.hpp)
+ 
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  list(REMOVE_ITEM SRC "${CMAKE_CURRENT_SOURCE_DIR}/metrics.cpp")
++  # image.cpp is kept ΓÇö needed for texture loading (stb_image)
++endif()
++
+ include_directories( ${CMAKE_SOURCE_DIR}/dependencies
+                      ${CMAKE_SOURCE_DIR}/dependencies/mmetric/source/lib/include
+                      ${CMAKE_SOURCE_DIR}/dependencies/mmetric/dependencies/
+@@ -40,7 +45,11 @@ include_directories( ${CMAKE_SOURCE_DIR}/dependencies
+ 
+ add_library( ${MYNAME} ${SRC} ${VERSION_FILE} )
+ 
+-target_link_libraries( ${MYNAME} mmlib atlasBitstream basemeshBitstream acDisplacementBitstream)
++if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
++  target_link_libraries( ${MYNAME} atlasBitstream basemeshBitstream acDisplacementBitstream)
++else()
++  target_link_libraries( ${MYNAME} mmlib atlasBitstream basemeshBitstream acDisplacementBitstream)
++endif()
+ 
+ set_target_properties( ${MYNAME} PROPERTIES LINKER_LANGUAGE CXX)
+ 
+diff --git a/source/lib/vmeshCommon/util/image.cpp b/source/lib/vmeshCommon/util/image.cpp
+index 387616a6..0ca71b39 100644
+--- a/source/lib/vmeshCommon/util/image.cpp
++++ b/source/lib/vmeshCommon/util/image.cpp
+@@ -39,6 +39,13 @@
+ 
+ namespace vmesh {
+ 
++#ifdef WASM_BUILD
++// In WASM builds, mmetric is not linked ΓÇö we must provide the STB implementations here.
++#  define STB_IMAGE_IMPLEMENTATION
++#  include <stb_image.h>
++#  define STB_IMAGE_WRITE_IMPLEMENTATION
++#  include <stb_image_write.h>
++#else
+ #ifndef STB_IMAGE_IMPLEMENTATION
+ // #define STB_IMAGE_IMPLEMENTATION
+ #  include <stb_image.h>
+@@ -48,6 +55,7 @@ namespace vmesh {
+ // #define STB_IMAGE_WRITE_IMPLEMENTATION
+ #  include <stb_image_write.h>
+ #endif
++#endif
+ 
+ //============================================================================
+ 
+diff --git a/source/lib/vmeshCommon/util/image.hpp b/source/lib/vmeshCommon/util/image.hpp
+index 139d16eb..8e13bcee 100644
+--- a/source/lib/vmeshCommon/util/image.hpp
++++ b/source/lib/vmeshCommon/util/image.hpp
+@@ -60,6 +60,7 @@ enum VideoEncoderId {
+   VV                    = 2,
+   JM                    = 3,
+   SHMAPP                = 4,
++  WEB                   = 5,  // WebCodecs (browser-native)
+   UNKNOWN_VIDEO_ENCODER = 255
+ };
+ 
+@@ -81,6 +82,9 @@ operator>>(std::istream& in, VideoEncoderId& val) {
+ #endif
+ #if defined(USE_SHMAPP_VIDEO_CODEC)
+   if (str == "shmapp" || str == "SHMAPP") val = VideoEncoderId::SHMAPP;
++#endif
++#if defined(USE_WEB_VIDEO_CODEC)
++  if (str == "web" || str == "WEB" || str == "WebCodecs") val = VideoEncoderId::WEB;
+ #endif
+   if (val == VideoEncoderId::UNKNOWN_VIDEO_ENCODER) {
+     in.setstate(std::ios::failbit);
+@@ -98,6 +102,9 @@ operator<<(std::ostream& out, VideoEncoderId val) {
+   case VideoEncoderId::VV: out << "VV"; break;
+   case VideoEncoderId::JM: out << "JM"; break;
+   case VideoEncoderId::SHMAPP: out << "SHMAPP"; break;
++#if defined(USE_WEB_VIDEO_CODEC)
++  case VideoEncoderId::WEB: out << "WEB"; break;
++#endif
+   case VideoEncoderId::UNKNOWN_VIDEO_ENCODER: out << "UNKNOWN"; break;
+   }
+   return out;
+@@ -178,6 +185,9 @@ toString(VideoEncoderId val) {
+   case VideoEncoderId::VTM: return "VTM";
+   case VideoEncoderId::VV: return "VV";
+   case VideoEncoderId::SHMAPP: return "SHMAPP";
++#if defined(USE_WEB_VIDEO_CODEC)
++  case VideoEncoderId::WEB: return "WEB";
++#endif
+   default: return "UNKNOWN";
+   }
+ }
+diff --git a/source/lib/vmeshCommon/util/mesh.cpp b/source/lib/vmeshCommon/util/mesh.cpp
+index 59bb26db..5a72a406 100644
+--- a/source/lib/vmeshCommon/util/mesh.cpp
++++ b/source/lib/vmeshCommon/util/mesh.cpp
+@@ -561,6 +561,7 @@ TriangleMesh<T>::saveToOBJUsingFidAsColor(const std::string& fileName) {
+ 
+ //----------------------------------------------------------------------------
+ 
++#ifndef WASM_BUILD
+ template<typename T>
+ bool
+ TriangleMesh<T>::saveToPLY(const std::string& fileName,
+@@ -651,9 +652,11 @@ TriangleMesh<T>::saveToPLY(const std::string& fileName,
+   ply.write(outstream, binary);
+   return true;
+ }
++#endif  // !WASM_BUILD
+ 
+ //----------------------------------------------------------------------------
+ 
++#ifndef WASM_BUILD
+ template<typename T>
+ bool
+ TriangleMesh<T>::loadFromPLY(const std::string& fileName) {
+@@ -750,6 +753,7 @@ TriangleMesh<T>::loadFromPLY(const std::string& fileName) {
+   }
+   return true;
+ }
++#endif  // !WASM_BUILD
+ 
+ //----------------------------------------------------------------------------
+ 
+diff --git a/source/lib/vmeshCommon/util/mesh.hpp b/source/lib/vmeshCommon/util/mesh.hpp
+index af4a941b..724959ea 100644
+--- a/source/lib/vmeshCommon/util/mesh.hpp
++++ b/source/lib/vmeshCommon/util/mesh.hpp
+@@ -1222,6 +1222,33 @@ public:
+   bool save(const std::string& fileName, const bool binary = true) const;
+   bool saveToOBJUsingFidAsColor(const std::string& fileName);
+ 
++  // === WASM DIRECT BUFFER ACCESS ===
++#ifdef WASM_BUILD
++public:
++  // Raw pointer access for zero-copy WASM interop
++  float* wasmPos() { return reinterpret_cast<float*>(_coord.data()); }
++  float* wasmNorm() { return reinterpret_cast<float*>(_normal.data()); }
++  float* wasmUV() { return reinterpret_cast<float*>(_texCoord.data()); }
++  size_t wasmPosLen() const { return _coord.size() * 3; }
++  size_t wasmNormLen() const { return _normal.size() * 3; }
++  size_t wasmUVLen() const { return _texCoord.size() * 2; }
++  int* wasmUVIdx() { return reinterpret_cast<int*>(_texCoordIndex.data()); }
++  size_t wasmUVIdxLen() const { return _texCoordIndex.size() * 3; }
++  int* wasmIdx() { return reinterpret_cast<int*>(_coordIndex.data()); }
++  size_t wasmIdxLen() const { return _coordIndex.size() * 3; }
++
++  // Set mesh from JS arrays (for encoder input)
++  void wasmSet(float* p, int pLen, float* uv, int uvLen, int* f, int fLen) {
++    _coord.resize(pLen / 3);
++    memcpy(_coord.data(), p, pLen * sizeof(float));
++    _texCoord.resize(uvLen / 2);
++    memcpy(_texCoord.data(), uv, uvLen * sizeof(float));
++    _coordIndex.resize(fLen / 3);
++    memcpy(_coordIndex.data(), f, fLen * sizeof(int));
++    _texCoordIndex = _coordIndex;
++  }
++#endif
++
+ private:
+   bool loadMaterials(const std::string&        fileName,
+                      std::vector<std::string>& materialNames,
+@@ -3674,7 +3701,7 @@ ExtractConnectedComponentsByNormal(
+   }
+ 
+   //get triangle normal direction and 3D area
+-  std::vector<Vec3<double>> triangleNormals;
++  std::vector<Vec3<T>> triangleNormals;
+   mesh.computeTriangleNormals(triangleNormals, true);
+   std::vector<double> triangleAreas;
+   mesh.computeTriangleAreas(triangleAreas);
+@@ -3684,7 +3711,7 @@ ExtractConnectedComponentsByNormal(
+   triangleNormalCategories.resize(triangleNormals.size());
+   for (size_t tri = 0; tri < triangleNormals.size(); tri++) {
+     auto& triNormal = triangleNormals[tri];
+-    if (triNormal == Vec3<double>(0.0)) {
++    if (triNormal == Vec3<T>(0)) {
+       triangleNormalCategories[tri] = -1;
+       continue;
+     }
+diff --git a/source/lib/vmeshCommon/util/vector.hpp b/source/lib/vmeshCommon/util/vector.hpp
+index 38ebf740..5a92c693 100644
+--- a/source/lib/vmeshCommon/util/vector.hpp
++++ b/source/lib/vmeshCommon/util/vector.hpp
+@@ -1088,15 +1088,13 @@ Round(Vec2<T> vec) {
+ 
+ //============================================================================
+ 
+-template<class T>
+-T Clamp(const T& v, const T& lo, const T& hi);
+-
+ template<class T>
+ Vec3<T>
+ Clamp(Vec3<T> vec, const T& lo, const T& hi) {
+-  vec[0] = Clamp(vec[0], lo, hi);
+-  vec[1] = Clamp(vec[1], lo, hi);
+-  vec[2] = Clamp(vec[2], lo, hi);
++  auto clamp1 = [&](const T& v) { return (v < lo) ? lo : (hi < v) ? hi : v; };
++  vec[0]      = clamp1(vec[0]);
++  vec[1]      = clamp1(vec[1]);
++  vec[2]      = clamp1(vec[2]);
+   return vec;
+ }
+ 
+diff --git a/source/lib/vmeshCommon/util/vector_patch.hpp b/source/lib/vmeshCommon/util/vector_patch.hpp
+new file mode 100644
+index 00000000..45316be3
+--- /dev/null
++++ b/source/lib/vmeshCommon/util/vector_patch.hpp
+@@ -0,0 +1,10 @@
++
++template<typename T>
++Vec3<T> operator*(const Vec3<T>& lhs, const T rhs) {
++  return Vec3<T>(lhs[0] * rhs, lhs[1] * rhs, lhs[2] * rhs);
++}
++
++template<typename T>
++Vec3<T> operator*(const T lhs, const Vec3<T>& rhs) {
++  return Vec3<T>(lhs * rhs[0], lhs * rhs[1], lhs * rhs[2]);
++}
+diff --git a/source/lib/vmeshCommon/vmc.hpp b/source/lib/vmeshCommon/vmc.hpp
+index a68ab705..1722f7f2 100644
+--- a/source/lib/vmeshCommon/vmc.hpp
++++ b/source/lib/vmeshCommon/vmc.hpp
+@@ -692,7 +692,7 @@ getDisplacementToPixelPerLod(
+ 
+   for (int32_t v = 0; v < lodVertexInfo[lodIndex].vertexCount; ++v) {
+     if (v > lodVertexInfo[lodIndex].vertexCount) {
+-      printf("lod[%d] vertexIndex(%d(=%d in Lod)) is out of range[%d,%d]\n",
++      printf("lod[%d] vertexIndex(%d in Lod) is out of range[%d,%d]\n",
+              lodIndex,
+              v,
+              lodVertexInfo[lodIndex].startVertexIndex,
+diff --git a/source/lib/vmeshCommon/vmcCommon.cpp b/source/lib/vmeshCommon/vmcCommon.cpp
+index eb13a844..3c7187c7 100644
+--- a/source/lib/vmeshCommon/vmcCommon.cpp
++++ b/source/lib/vmeshCommon/vmcCommon.cpp
+@@ -1864,10 +1864,10 @@ addtexture(std::vector<TriangleMesh<MeshType>>& submeshes,
+     for (int triIndex = originTCount;
+          triIndex < submeshes[submeshIdx].triangleCount();
+          triIndex++) {
+-      Vec3<double>              v0_geo, v1_geo, v2_geo;
+-      Vec2<double>              v0_uv, v1_uv, v2_uv_judge, v2_new;
+-      Vec2<double>              uvProj, uvProjuvCurr;
+-      std::vector<Vec2<double>> v2_uv;
++      Vec3<MeshType>              v0_geo, v1_geo, v2_geo;
++      Vec2<MeshType>              v0_uv, v1_uv, v2_uv_judge, v2_new;
++      Vec2<MeshType>              uvProj, uvProjuvCurr;
++      std::vector<Vec2<MeshType>> v2_uv;
+       int  tri_judge, texCoordIndex0 = 0, texCoordIndex1 = 0;
+       auto tri1 = submeshes[submeshIdx].triangle(triIndex);
+       int  j    = 0;
+diff --git a/source/lib/vmeshCommon/wasm_stubs.cpp b/source/lib/vmeshCommon/wasm_stubs.cpp
+new file mode 100644
+index 00000000..c210ddfc
+--- /dev/null
++++ b/source/lib/vmeshCommon/wasm_stubs.cpp
+@@ -0,0 +1,144 @@
++/* WASM stubs for excluded functionality 
++ * This file provides stub implementations for functions that are
++ * not available in WASM builds (metrics, image saving, PLY support).
++ */
++#ifdef WASM_BUILD
++
++#include <string>
++#include <vector>
++#include "vmc.hpp"
++#include "util/mesh.hpp"
++#include "util/image.hpp"
++#include "metrics.hpp"
++#include "glm/glm.hpp"
++
++namespace mm {
++  class Model {};
++  class Image {};
++  namespace Dequantize {
++    void dequantize(const Model& src, Model& dst, unsigned int qp, unsigned int qt, 
++                    unsigned int qn, unsigned int qc, const glm::vec3& minPos, 
++                    const glm::vec3& maxPos, const glm::vec2& minUv, const glm::vec2& maxUv, 
++                    const glm::vec3& minNrm, const glm::vec3& maxNrm, const glm::vec3& minCol, 
++                    const glm::vec3& maxCol, bool useFixedPoint, bool colorSpaceConversion, 
++                    bool verbose) {}
++  }
++  namespace Geometry {
++    bool evalRayTriangle(const glm::vec3& orig, const glm::vec3& dir, const glm::vec3& v0, 
++                         const glm::vec3& v1, const glm::vec3& v2, glm::vec3& intersection, 
++                         float tmax) { return false; }
++    void getBarycentric(glm::vec2 p, glm::vec2 a, glm::vec2 b, glm::vec2 c, glm::vec3& barycentric) {}
++  }
++}
++
++namespace vmesh {
++
++//============================================================================
++// Frame stubs ΓÇö image.cpp now provides real implementations (stb_image)
++// Only FrameSequence::save is kept as a no-op (intermediate files not needed)
++//============================================================================
++
++template<typename T>
++bool FrameSequence<T>::save(const std::string& path, const int32_t frameStart) { return true; }
++
++//============================================================================
++// PLY stubs - PLY format not used in WASM, only OBJ
++//============================================================================
++
++template<typename T>
++bool
++TriangleMesh<T>::saveToPLY(const std::string& fileName, const bool binary) const {
++  (void)fileName;
++  (void)binary;
++  return false; // PLY not supported in WASM
++}
++
++template<typename T>
++bool
++TriangleMesh<T>::loadFromPLY(const std::string& fileName) {
++  (void)fileName;
++  return false; // PLY not supported in WASM
++}
++
++// Explicit template instantiations for TriangleMesh
++template bool TriangleMesh<float>::saveToPLY(const std::string&, const bool) const;
++template bool TriangleMesh<float>::loadFromPLY(const std::string&);
++template bool TriangleMesh<double>::saveToPLY(const std::string&, const bool) const;
++template bool TriangleMesh<double>::loadFromPLY(const std::string&);
++
++} // namespace vmesh
++
++//============================================================================
++// VMCMetrics stubs ΓÇö metrics not computed in WASM build
++//============================================================================
++
++namespace vmesh {
++
++void VMCMetrics::compute(const Sequence&, const Sequence&,
++                         const VMCMetricsParameters&) {}
++
++void VMCMetrics::compute(const std::string, const std::string,
++                         const std::vector<std::string>,
++                         const std::vector<std::string>,
++                         const VMCMetricsParameters&) {}
++
++template<typename T>
++void VMCMetrics::compute(const TriangleMesh<T>&, const TriangleMesh<T>&,
++                         const std::vector<Frame<uint8_t>>,
++                         const std::vector<Frame<uint8_t>>,
++                         const VMCMetricsParameters&) {}
++
++template<typename T>
++void VMCMetrics::compute(const TriangleMesh<T>&, const TriangleMesh<T>&,
++                         const VMCMetricsParameters&) {}
++
++template<typename T>
++void VMCMetrics::computePerFace(const TriangleMesh<T>&, const TriangleMesh<T>&,
++                                const std::vector<Frame<uint8_t>>,
++                                const std::vector<Frame<uint8_t>>,
++                                const VMCMetricsParameters&,
++                                std::vector<std::vector<double>>&,
++                                std::vector<Vec2<int>>&,
++                                std::string, bool) {}
++
++void VMCMetrics::display(const bool) {}
++
++std::vector<double> VMCMetrics::getPccResults()  { return {}; }
++std::vector<double> VMCMetrics::getIbsmResults() { return {}; }
++std::vector<double> VMCMetrics::getPcqmResults() { return {}; }
++
++std::vector<std::vector<double>>
++VMCMetrics::getPccResultsPerPoint(const int) { return {}; }
++
++std::vector<std::vector<double>>
++VMCMetrics::getPccResultsPerPointMse(const int) { return {}; }
++
++// Explicit instantiations
++template void VMCMetrics::compute<float>(
++  const TriangleMesh<float>&, const TriangleMesh<float>&,
++  const std::vector<Frame<uint8_t>>, const std::vector<Frame<uint8_t>>,
++  const VMCMetricsParameters&);
++template void VMCMetrics::compute<double>(
++  const TriangleMesh<double>&, const TriangleMesh<double>&,
++  const std::vector<Frame<uint8_t>>, const std::vector<Frame<uint8_t>>,
++  const VMCMetricsParameters&);
++template void VMCMetrics::compute<float>(
++  const TriangleMesh<float>&, const TriangleMesh<float>&,
++  const VMCMetricsParameters&);
++template void VMCMetrics::compute<double>(
++  const TriangleMesh<double>&, const TriangleMesh<double>&,
++  const VMCMetricsParameters&);
++template void VMCMetrics::computePerFace<float>(
++  const TriangleMesh<float>&, const TriangleMesh<float>&,
++  const std::vector<Frame<uint8_t>>, const std::vector<Frame<uint8_t>>,
++  const VMCMetricsParameters&, std::vector<std::vector<double>>&,
++  std::vector<Vec2<int>>&, std::string, bool);
++template void VMCMetrics::computePerFace<double>(
++  const TriangleMesh<double>&, const TriangleMesh<double>&,
++  const std::vector<Frame<uint8_t>>, const std::vector<Frame<uint8_t>>,
++  const VMCMetricsParameters&, std::vector<std::vector<double>>&,
++  std::vector<Vec2<int>>&, std::string, bool);
++
++} // namespace vmesh
++
++#endif // WASM_BUILD
+diff --git a/source/lib/vmeshDecoder/decoder.cpp b/source/lib/vmeshDecoder/decoder.cpp
+index e11eb7d1..24b8cbd3 100644
+--- a/source/lib/vmeshDecoder/decoder.cpp
++++ b/source/lib/vmeshDecoder/decoder.cpp
+@@ -35,6 +35,10 @@
+ 
+ #include "decoder.hpp"
+ 
++#ifdef WASM_BUILD
++#include <emscripten.h>
++#endif
++
+ #include <cstdio>
+ #include <sstream>
+ #include <iostream>
+@@ -47,6 +51,45 @@
+ #include "../acDisplacementDecoder/acDisplacementDecoder.hpp"
+ #include "acDisplacementFrame.hpp"
+ 
++#ifdef WASM_BUILD
++// File-scoped storage for displacement parameters (WASM path only)
++// Bridging reconstructSubmesh (where baseDecodedPatch is available) and 
++// appendReconstructedSubmeshes (where onBaseMesh emits)
++struct WasmDispParams {
++  int32_t frameId = -1;
++  int32_t subdivIterationCount = 0;
++  int32_t dispWidth = 0;
++  int32_t dispHeight = 0;
++  int32_t log2BlockSize = 0;
++  int32_t packingMethod = 0;
++  int32_t geomBitDepth = 0;
++  int32_t oneDimDisplacementFlag = 0;
++  int32_t interpolateNormalsFlag = 0;
++  std::vector<std::vector<double>> iscale;  // [lod][dim]
++  int32_t lodCount = 0;
++  int32_t dispDimension = 0;
++  bool iqOffsetFlag = false;
++  
++  void reset() {
++    frameId = -1;
++    subdivIterationCount = 0;
++    dispWidth = 0;
++    dispHeight = 0;
++    log2BlockSize = 0;
++    packingMethod = 0;
++    geomBitDepth = 0;
++    oneDimDisplacementFlag = 0;
++    interpolateNormalsFlag = 0;
++    iscale.clear();
++    lodCount = 0;
++    dispDimension = 0;
++    iqOffsetFlag = false;
++  }
++};
++
++static WasmDispParams g_wasmDispParams;
++#endif
++
+ 
+ namespace vmesh {
+ 
+@@ -239,6 +282,9 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+   FrameSequence<uint16_t>              dispVideo;
+   std::vector<std::vector<acdisplacement::AcDisplacementFrame>> decodedAcDispls;
+   if (vps.getVpsPackedVideoExtension().getPackedVideoPresentFlag(atlasId)) {
++#ifdef WASM_BUILD
++    printf("[WASM] WARNING: packed video present -- not supported in WASM Option B, skipping\n");
++#else
+     std::cout << "decompressPackedVideo\n";
+     auto numPVD = syntax.getV3CUnitPVD().size();
+     if (numPVD > 1) std::cout << "WARNING: #PVD is " << numPVD << "\n";
+@@ -281,9 +327,23 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+                     params);
+     reconstruct.attribute(attrIndex) = attrVideo16;
+     attrVideo16.clear();
++#endif  // WASM_BUILD
+   }
+ 
+   if (vps.getGeometryVideoPresentFlag(atlasId)) {
++#ifdef WASM_BUILD
++    {
++      auto& videoData = syntax.getV3CUnitGVD(0).vector();
++      printf("[WASM] Forwarding GVD displacement HEVC stream: %zu bytes, %d frames\n",
++             videoData.size(), atlasFrameCount);
++      EM_ASM({
++        if (Module.enqueueVideo) {
++          var bs = new Uint8Array(Module.HEAPU8.buffer, $0, $1).slice();
++          Module.enqueueVideo(0, bs, $2, $3);
++        }
++      }, videoData.data(), (int)videoData.size(), (int)atlasFrameCount, 0);
++    }
++#else
+     auto codecGroupIdc = VideoCodecGroupIdc::HEVC_Main10;
+     if (vps.getProfileTierLevel().getPtlVideoCodecGroupIdc()
+           == VideoCodecGroupIdc::Video_MP4RA
+@@ -315,6 +375,7 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+     TRACE_PICTURE("MapIdx = 0, AuxiliaryVideoFlag = 0\n");
+     getPictureLog(dispVideo);
+ #endif
++#endif  // WASM_BUILD
+   } else if (vps.getVpsVdmcExtension().getVpsExtACDisplacementPresentFlag(atlasId)) {
+     std::cout << "decompressDisplacements(AC)\n";
+     ACDisplacementDecoder dispDecoder;
+@@ -328,6 +389,19 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+   }
+ 
+   if (vps.getAttributeVideoPresentFlag(atlasId)) {
++#ifdef WASM_BUILD
++    {
++      auto& videoData = syntax.getV3CUnitAVD(0).vector();
++      printf("[WASM] Forwarding AVD texture HEVC stream: %zu bytes, %d frames\n",
++             videoData.size(), atlasFrameCount);
++      EM_ASM({
++        if (Module.enqueueVideo) {
++          var bs = new Uint8Array(Module.HEAPU8.buffer, $0, $1).slice();
++          Module.enqueueVideo(1, bs, $2, $3);
++        }
++      }, videoData.data(), (int)videoData.size(), (int)atlasFrameCount, 0);
++    }
++#else
+     std::cout << "decompressTextureVideo\n";
+     auto numAVD = syntax.getV3CUnitAVD().size();
+     if (numAVD > 1){
+@@ -425,6 +499,7 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+         return -1;
+       }
+     }
++#endif  // WASM_BUILD
+   } else if (!vps.getVpsPackedVideoExtension().getPackedVideoPresentFlag(
+                atlasId)) {
+     reconstruct.attributes().clear();
+@@ -491,8 +566,11 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+                              displacementCodedType,
+                              params,
+                              outputSubmesh);
++          printf("DBG: reconstructSubmesh returned successfully\n"); fflush(stdout);
+           // workaround when no video attributes (no XX_TILE_ATTR tiles)
++          printf("DBG: tileIndexAttribute=%d\n", tileIndexAttribute); fflush(stdout);
+           if (tileIndexAttribute == -1) {
++            printf("DBG: entering texture coordinate workaround\n"); fflush(stdout);
+             //TODO: attributeIndex needs to be index for texture coordinates
+             int32_t attributeIndex = 0;
+             auto& asve =
+@@ -518,10 +596,15 @@ VMCDecoder::decompress(V3cBitstream&               syntax,
+                   i, outputSubmesh.rec.texCoord(i) * scale);
+               }
+             }
++            printf("DBG: texture coordinate workaround complete\n"); fflush(stdout);
+           }
++          printf("DBG: end of patch processing\n"); fflush(stdout);
+         }  //patch
++        printf("DBG: patch loop done\n"); fflush(stdout);
+       }
++      printf("DBG: tile loop iteration done\n"); fflush(stdout);
+     }  //tile
++    printf("DBG: tile loop complete\n"); fflush(stdout);
+ 
+ #if CONFORMANCE_LOG_DEC
+     getAtlasLog(frameIndex, decodedTiles, syntax, vps);
+@@ -714,6 +797,55 @@ VMCDecoder::reconstructSubmesh(
+                                      baseDecodedPatch);
+   }
+ 
++#ifdef WASM_BUILD
++  // Option B: emit base mesh only -- no subdivision, no displacement
++  // Capture displacement parameters for later emit in appendReconstructedSubmeshes
++  if (g_wasmDispParams.frameId != frameIndex) {
++    // First submesh for this frame - store params
++    g_wasmDispParams.reset();
++    g_wasmDispParams.frameId = frameIndex;
++    g_wasmDispParams.subdivIterationCount = baseDecodedPatch.subdivIteration;
++    
++    // Displacement video dimensions
++    if (displacementCodedType == 2) {  // video-coded displacement
++      g_wasmDispParams.dispWidth = dispVideo.width();
++      g_wasmDispParams.dispHeight = dispVideo.height();
++    }
++    
++    // Get the tile ASPS (same as used later for displacement packing)
++    auto& asps = aspsList[decodedTile.tileAspsId_];
++    auto& asve = projAsps.getAsveExtension();
++    
++    // Packing/encoding parameters
++    g_wasmDispParams.log2BlockSize = asps.getLog2PatchPackingBlockSize();
++    g_wasmDispParams.packingMethod = asve.getAsvePackingMethod();
++    g_wasmDispParams.geomBitDepth = geometryVideoBitDepth;
++    g_wasmDispParams.oneDimDisplacementFlag = asve.getAsve1DDisplacementFlag();
++    g_wasmDispParams.interpolateNormalsFlag = asve.getAsveInterpolateSubdividedNormalsFlag();
++    
++    // Dequantization scale (iscale) - only if displacement is present and not skipped
++    if (displacementCodedType != 0 && (!baseDecodedPatch.IQ_skip)) {
++      g_wasmDispParams.dispDimension = asve.getAspsDispComponents();
++      g_wasmDispParams.iscale = baseDecodedPatch.quantizationParameters.iscale;
++      g_wasmDispParams.lodCount = static_cast<int32_t>(g_wasmDispParams.iscale.size());
++      g_wasmDispParams.iqOffsetFlag = baseDecodedPatch.iqOffsetFlag;
++      
++      printf("WASM: Captured disp params for frame %d: subdivIter=%d, dispDim=%d x %d, "
++             "log2Block=%d, packMethod=%d, geomBits=%d, 1Ddisp=%d, interpNorm=%d, "
++             "lodCount=%d, dispDim=%d, iqOffsetFlag=%d\n",
++             frameIndex, g_wasmDispParams.subdivIterationCount,
++             g_wasmDispParams.dispWidth, g_wasmDispParams.dispHeight,
++             g_wasmDispParams.log2BlockSize, g_wasmDispParams.packingMethod,
++             g_wasmDispParams.geomBitDepth, g_wasmDispParams.oneDimDisplacementFlag,
++             g_wasmDispParams.interpolateNormalsFlag, g_wasmDispParams.lodCount,
++             g_wasmDispParams.dispDimension, g_wasmDispParams.iqOffsetFlag ? 1 : 0);
++    }
++  }
++  
++  recSubmesh.rec = decodedSubmesh.base;
++  return true;
++#endif
++
+   //11.2.3  Subdivision process
+   if (baseDecodedPatch.subdivIteration >= 0) {
+     if (!LoDExtractionEnable) {
+@@ -1000,8 +1132,8 @@ VMCDecoder::adjustTextureCoordinates(const V3CParameterSet&  vps,
+                                      TriangleMesh<MeshType>& submesh) {
+   auto LTx = decodedPatch.attributePatchArea[attributeIndex].LTx
+              + decodedTile.tileAttributeAreas_[attributeIndex].LTx;
+-  auto LTy = decodedPatch.attributePatchArea[attributeIndex].LTy;
+-  +decodedTile.tileAttributeAreas_[attributeIndex].LTx;
++  auto LTy = decodedPatch.attributePatchArea[attributeIndex].LTy
++             + decodedTile.tileAttributeAreas_[attributeIndex].LTy;
+ 
+   vmesh::adjustTextureCoordinates(
+     submesh,
+@@ -1046,6 +1178,109 @@ VMCDecoder::appendReconstructedSubmeshes(
+       std::cout << "***************************************************\n";
+     }
+   }  //submeshIdx
++
++#ifdef WASM_BUILD
++  printf("C++ appendReconstructedSubmeshes WASM_BUILD frame %d, calling Module.onBaseMesh\n",
++         frameIndex);
++  
++  // Compute edge lookup table from base connectivity (NO subdivision)
++  const int32_t baseVertexCount = reconstructed.pointCount();
++  const int32_t baseTriCount = reconstructed.triangleCount();
++  
++  // Copy triangles for edge computation (initializeSubdiv modifies them in-place)
++  std::vector<Triangle> trianglesCopy(baseTriCount);
++  for (int32_t t = 0; t < baseTriCount; t++) {
++    trianglesCopy[t] = reconstructed.triangle(t);
++  }
++  
++  // Build edge table using the subdivision helpers
++  std::vector<int> valences;
++  StaticAdjacencyInformation<int32_t> vertexToTriangle;
++  StaticAdjacencyInformation<int32_t> vertexToEdge;
++  std::vector<int8_t> vtags;
++  std::vector<int64_t> edges;
++  
++  initializeSubdiv(baseVertexCount, trianglesCopy, false, valences,
++                   vertexToTriangle, vertexToEdge, vtags, edges);
++  
++  const int32_t baseEdgesCount = static_cast<int32_t>(edges.size()) - baseVertexCount;
++  
++  // Build edgeTable[3*t+k] = 0-based global base-edge index
++  std::vector<int32_t> edgeTable(3 * baseTriCount);
++  for (int32_t t = 0; t < baseTriCount; t++) {
++    for (int32_t k = 0; k < 3; k++) {
++      edgeTable[3*t + k] = static_cast<int32_t>(trianglesCopy[t][k] - baseVertexCount);
++    }
++  }
++  
++  // Sanity check for frame 0 (log once)
++  if (frameIndex == 0) {
++    printf("WASM: Frame 0 edge table: %d entries (3*%d tris), baseEdgesCount=%d, baseVertexCount=%d\n",
++           static_cast<int32_t>(edgeTable.size()), baseTriCount, baseEdgesCount, baseVertexCount);
++    bool allValid = true;
++    for (size_t i = 0; i < edgeTable.size(); i++) {
++      if (edgeTable[i] < 0 || edgeTable[i] >= baseEdgesCount) {
++        printf("ERROR: edgeTable[%zu] = %d out of range [0, %d)\n", i, edgeTable[i], baseEdgesCount);
++        allValid = false;
++      }
++    }
++    if (allValid) {
++      printf("WASM: Frame 0 edge table validation: ALL ENTRIES IN RANGE [0, %d)\n", baseEdgesCount);
++    }
++  }
++  
++  // Flatten iscale[lod][dim] to float32 array (row-major)
++  std::vector<float> iscaleFlat;
++  if (g_wasmDispParams.frameId == frameIndex && g_wasmDispParams.lodCount > 0) {
++    iscaleFlat.reserve(g_wasmDispParams.lodCount * g_wasmDispParams.dispDimension);
++    for (int lod = 0; lod < g_wasmDispParams.lodCount; lod++) {
++      for (int dim = 0; dim < g_wasmDispParams.dispDimension; dim++) {
++        iscaleFlat.push_back(static_cast<float>(g_wasmDispParams.iscale[lod][dim]));
++      }
++    }
++  }
++  
++  // Emit displacement parameters BEFORE base mesh
++  EM_ASM({
++    if (Module.onDispParams) {
++      Module.onDispParams($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
++    } else {
++      console.warn("Module.onDispParams not defined (will be added in VDMCDecoder.js)");
++    }
++  },
++    frameIndex,
++    edgeTable.data(), static_cast<int32_t>(edgeTable.size()),
++    baseEdgesCount,
++    baseVertexCount,
++    g_wasmDispParams.subdivIterationCount,
++    g_wasmDispParams.dispWidth, g_wasmDispParams.dispHeight,
++    g_wasmDispParams.log2BlockSize,
++    g_wasmDispParams.packingMethod,
++    g_wasmDispParams.geomBitDepth,
++    g_wasmDispParams.oneDimDisplacementFlag,
++    g_wasmDispParams.interpolateNormalsFlag,
++    iscaleFlat.data(), static_cast<int32_t>(iscaleFlat.size()),
++    g_wasmDispParams.lodCount, g_wasmDispParams.dispDimension);
++  
++  printf("C++ emitted onDispParams for frame %d: edgeTable=%zu entries, baseEdgesCount=%d, iscaleLen=%zu\n",
++         frameIndex, edgeTable.size(), baseEdgesCount, iscaleFlat.size());
++  
++  // Option B: emit base mesh (pre-subdivision) to JS for the WebCodecs 3-queue renderer.
++  // Normals are intentionally omitted; SubdivideMesh.js recomputes them.
++  EM_ASM({
++    if (Module.onBaseMesh) {
++      Module.onBaseMesh($0, $1, $2, $3, $4, $5, $6, $7, $8);
++    } else {
++      console.error("Module.onBaseMesh not defined");
++    }
++  },
++    frameIndex,
++    reconstructed.wasmPos(), reconstructed.wasmPosLen(),
++    reconstructed.wasmIdx(), reconstructed.wasmIdxLen(),
++    reconstructed.wasmUV(), reconstructed.wasmUVLen(),
++    reconstructed.wasmUVIdx(), reconstructed.wasmUVIdxLen());
++  printf("C++ appendReconstructedSubmeshes onBaseMesh called for frame %d\n", frameIndex);
++#endif
+ }
+ int32_t
+ VMCDecoder::subdivideBaseMesh(TriangleMesh<MeshType>&         base,
+diff --git a/source/lib/vmeshDecoder/decoderOAuvcoord.cpp b/source/lib/vmeshDecoder/decoderOAuvcoord.cpp
+index 11ece468..7fd6d7f6 100644
+--- a/source/lib/vmeshDecoder/decoderOAuvcoord.cpp
++++ b/source/lib/vmeshDecoder/decoderOAuvcoord.cpp
+@@ -343,5 +343,6 @@ VMCDecoder::reconstructBaseMeshUvCoordinates(
+     base.setTexCoordTriangle(triIdx,
+                              vmesh::Triangle(uvIdx[0], uvIdx[1], uvIdx[2]));
+   }
++
+   return 0;
+ }
+diff --git a/source/wrapper/videoDecoder/CMakeLists.txt b/source/wrapper/videoDecoder/CMakeLists.txt
+index 31b4716f..61fe3471 100644
+--- a/source/wrapper/videoDecoder/CMakeLists.txt
++++ b/source/wrapper/videoDecoder/CMakeLists.txt
+@@ -36,6 +36,12 @@ if( USE_VV_VIDEO_CODEC )
+   SET( LIBS ${LIBS} vvdec )
+ endif()
+ 
++# WebCodecs
++if( USE_WEB_VIDEO_DECODER )
++  # No external dependencies needed ΓÇö WebCodecs is browser-native
++  set( LIBS ${LIBS} )
++endif()
++
+ add_library( ${MYNAME}  ${SRC} ${SRCVTM})
+ 
+ If( MSVC )
+diff --git a/source/wrapper/videoDecoder/videoDecoder.cpp b/source/wrapper/videoDecoder/videoDecoder.cpp
+index 63582f0a..b5e02d56 100644
+--- a/source/wrapper/videoDecoder/videoDecoder.cpp
++++ b/source/wrapper/videoDecoder/videoDecoder.cpp
+@@ -39,6 +39,9 @@
+ #if defined(USE_SHMAPP_VIDEO_CODEC)
+ #  include "shmAppVideoDecoder.hpp"
+ #endif
++#if defined(USE_WEB_VIDEO_DECODER)
++#  include "webVideoDecoder.hpp"
++#endif
+ 
+ namespace vmesh {
+ 
+@@ -63,6 +66,11 @@ VideoDecoder<T>::create(VideoEncoderId codecId) {
+   case VideoEncoderId::SHMAPP:
+     return std::make_shared<shmAppVideoDecoder<T>>();
+     break;
++#endif
++#if defined(USE_WEB_VIDEO_DECODER)
++  case VideoEncoderId::WEB:
++    return std::make_shared<webVideoDecoder<T>>();
++    break;
+ #endif
+   default:
+     printf("Error: codec id not supported \n");
+diff --git a/source/wrapper/videoDecoder/videoDecoder.hpp b/source/wrapper/videoDecoder/videoDecoder.hpp
+index ee21eccf..95b46a0f 100644
+--- a/source/wrapper/videoDecoder/videoDecoder.hpp
++++ b/source/wrapper/videoDecoder/videoDecoder.hpp
+@@ -40,7 +40,7 @@ template<class T>
+ class VideoDecoder {
+ public:
+   VideoDecoder()  = default;
+-  ~VideoDecoder() = default;
++  virtual ~VideoDecoder() = default;
+ 
+   static std::shared_ptr<VideoDecoder<T>> create(VideoEncoderId coderId);
+ 
+diff --git a/source/wrapper/videoDecoder/webVideoDecoder.cpp b/source/wrapper/videoDecoder/webVideoDecoder.cpp
+new file mode 100644
+index 00000000..c76cf836
+--- /dev/null
++++ b/source/wrapper/videoDecoder/webVideoDecoder.cpp
+@@ -0,0 +1,31 @@
++#if defined(USE_WEB_VIDEO_DECODER)
++
++#  include "webVideoDecoder.hpp"
++#  include "webVideoDecoderImpl.hpp"
++
++namespace vmesh {
++
++template <typename T>
++webVideoDecoder<T>::webVideoDecoder() = default;
++
++template <typename T>
++webVideoDecoder<T>::~webVideoDecoder() = default;
++
++template <typename T>
++void
++webVideoDecoder<T>::decode(const std::vector<uint8_t>& bitstream,
++                           FrameSequence<T>&           video,
++                           std::vector<size_t>&        videoBitDepth,
++                           size_t                      layerIdx,
++                           const std::string&          decoderPath,
++                           const std::string&          parameters) {
++  webVideoDecoderImpl<T> impl;
++  impl.decode(bitstream, video, videoBitDepth, layerIdx, decoderPath, parameters);
++}
++
++template class webVideoDecoder<uint8_t>;
++template class webVideoDecoder<uint16_t>;
++
++}  // namespace vmesh
++
++#endif
+diff --git a/source/wrapper/videoDecoder/webVideoDecoder.hpp b/source/wrapper/videoDecoder/webVideoDecoder.hpp
+new file mode 100644
+index 00000000..37461670
+--- /dev/null
++++ b/source/wrapper/videoDecoder/webVideoDecoder.hpp
+@@ -0,0 +1,26 @@
++#pragma once
++
++#if defined(USE_WEB_VIDEO_DECODER)
++
++#  include "util/image.hpp"
++#  include "videoDecoder.hpp"
++
++namespace vmesh {
++
++template <class T>
++class webVideoDecoder final : public VideoDecoder<T> {
++public:
++  webVideoDecoder();
++  ~webVideoDecoder() override;
++
++  void decode(const std::vector<uint8_t>& bitstream,
++              FrameSequence<T>&           video,
++              std::vector<size_t>&        videoBitDepth,
++              size_t                      layerIdx = 0,
++              const std::string&          decoderPath = "",
++              const std::string&          parameters = "") override;
++};
++
++}  // namespace vmesh
++
++#endif
+diff --git a/source/wrapper/videoDecoder/webVideoDecoderImpl.cpp b/source/wrapper/videoDecoder/webVideoDecoderImpl.cpp
+new file mode 100644
+index 00000000..7a24950e
+--- /dev/null
++++ b/source/wrapper/videoDecoder/webVideoDecoderImpl.cpp
+@@ -0,0 +1,151 @@
++#if defined(USE_WEB_VIDEO_DECODER)
++
++#    include "webVideoDecoderImpl.hpp"
++
++#    include <cstdio>
++#    include <cstring>
++#    include <sstream>
++
++#    ifdef __EMSCRIPTEN__
++#    include <emscripten.h>
++#    include <emscripten/bind.h>
++#    endif
++
++namespace vmesh {
++
++template <typename T>
++webVideoDecoderImpl<T>::webVideoDecoderImpl() = default;
++
++template <typename T>
++webVideoDecoderImpl<T>::~webVideoDecoderImpl() = default;
++
++template <typename T>
++void
++webVideoDecoderImpl<T>::decode(const std::vector<uint8_t>& bitstream,
++                               FrameSequence<T>&           video,
++                               std::vector<size_t>&        videoBitDepth,
++                               size_t                      layerIdx,
++                               const std::string&          decoderPath,
++                               const std::string&          parameters) {
++#    ifdef __EMSCRIPTEN__
++  // WASM Option B: video decode is handled in JS via WebCodecs.
++  // Raw HEVC bytes are forwarded from decoder.cpp via Module.enqueueVideo(),
++  // so the C++ video decoder path is bypassed entirely here.
++  printf("[WebDecoder] WASM mode ΓÇö video decode bypassed (handled by JS WebCodecs)\n");
++  fflush(stdout);
++  return;
++#    else
++  size_t width = 0, height = 0, bitDepth = 10, frameCount = 0;
++
++  // Parse bitstream or use parameters to determine dimensions
++  if (bitstream.empty()) {
++    printf("[WebDecoder] Empty bitstream ΓÇö skipping\n");
++    fflush(stdout);
++    return;
++  }
++
++  parseBitstreamInfo(bitstream, width, height, bitDepth, frameCount);
++
++  // If we couldn't parse, fall back to parameter defaults
++  if (frameCount == 0) frameCount = 1;
++  if (width == 0) width = 512;  // common V-DMC default
++  if (height == 0) height = 512;
++
++  printf("[WebDecoder] Decoding %zu frames: %dx%d, bitDepth=%zu\n",
++         frameCount, width, height, bitDepth);
++  fflush(stdout);
++
++  // Allocate output FrameSequence
++  video.resize(static_cast<int>(width), static_cast<int>(height),
++               ColourSpace::YUV420p, static_cast<int>(frameCount), 512);
++
++  // Fill videoBitDepth
++  videoBitDepth.resize(frameCount > 0 ? frameCount : 1, bitDepth);
++
++  // Non-WASM fallback: create placeholder frames
++  printf("[WebDecoder] Running in non-WASM mode ΓÇö writing placeholder frames\n");
++  for (size_t f = 0; f < frameCount; f++) {
++    auto& frame = video.frame(static_cast<int>(f));
++    // Fill Y plane with mid-gray (128 for 8-bit, 512 for 10-bit)
++    const T midGray = static_cast<T>((1 << (bitDepth - 1)));
++    for (size_t plane = 0; plane < 3; plane++) {
++      for (size_t i = 0; i < frame.plane(plane).size(); i++) {
++        frame.plane(plane).set(0, 0, plane, plane == 0 ? midGray : midGray / 2);
++      }
++    }
++  }
++#    endif
++}
++
++template <typename T>
++void
++webVideoDecoderImpl<T>::parseBitstreamInfo(const std::vector<uint8_t>& bitstream,
++                                           size_t& width,
++                                           size_t& height,
++                                           size_t& bitDepth,
++                                           size_t& frameCount) {
++  // Attempt to parse minimal info from AV1/VP9 bitstream container.
++  // This is a simplified parser ΓÇö full parsing requires AV1/VP9 Annex-B parser.
++  // For now, we rely on the bitstream size to estimate frame count if width/height unknown.
++
++  if (bitstream.size() < 8) {
++    return;  // Too small to be valid
++  }
++
++  // Look for AV1 config sequence byte (first byte of AV1 Coded Sequence)
++  // In Annex-B format, look for start codes (0x00 0x00 0x00 0x01)
++  for (size_t i = 0; i + 4 < bitstream.size(); i++) {
++    if (bitstream[i] == 0x00 && bitstream[i + 1] == 0x00
++        && bitstream[i + 2] == 0x00 && bitstream[i + 3] == 0x01) {
++      if (i + 5 < bitstream.size()) {
++        uint8_t firstByte = bitstream[i + 4];
++        uint8_t forbiddenBit = (firstByte >> 7) & 0x01;
++        uint8_t olr = (firstByte >> 4) & 0x07;  // Output Level Restriction
++
++        if (forbiddenBit == 0) {
++          // Map output level to approximate width/height
++          // Level 0: up to 256x144, Level 1: up to 352x288, etc.
++          // This is a rough heuristic
++          static const uint32_t levels[][2] = {
++              {256, 144},   // Level 0
++              {352, 288},   // Level 1
++              {640, 360},   // Level 2
++              {640, 480},   // Level 3
++              {1280, 720},  // Level 4
++              {1920, 1080}, // Level 5
++              {2048, 1152}, // Level 5b
++              {4096, 2304}  // Level 6
++          };
++          if (olr < sizeof(levels) / sizeof(levels[0])) {
++            width  = levels[olr][0];
++            height = levels[olr][1];
++          }
++        }
++        break;
++      }
++    }
++  }
++
++  // Estimate frame count from bitstream size (rough heuristic for known dimensions)
++  if (width > 0 && height > 0) {
++    const double bytesPerFrame = width * height * 3.0 / 8.0 * 0.5;  // YUV420, ~0.5 bpp avg
++    frameCount = static_cast<size_t>(bitstream.size() / bytesPerFrame);
++  }
++
++  bitDepth = 10;  // V-DMC default
++}
++
++template <typename T>
++std::string
++webVideoDecoderImpl<T>::buildCodecConfig(const std::string& parameters) const {
++  // Parse parameters string for width/height hints
++  // Default to HEVC Main10 (matches V-DMC texture/displacement streams and the JS SDK)
++  return "hvc1.2.4.L153.B0";
++}
++
++template class webVideoDecoderImpl<uint8_t>;
++template class webVideoDecoderImpl<uint16_t>;
++
++}  // namespace vmesh
++
++#endif
+diff --git a/source/wrapper/videoDecoder/webVideoDecoderImpl.hpp b/source/wrapper/videoDecoder/webVideoDecoderImpl.hpp
+new file mode 100644
+index 00000000..5783512d
+--- /dev/null
++++ b/source/wrapper/videoDecoder/webVideoDecoderImpl.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#if defined(USE_WEB_VIDEO_DECODER)
++
++#    include "util/image.hpp"
++
++namespace vmesh {
++
++template <class T>
++class webVideoDecoderImpl {
++public:
++  webVideoDecoderImpl();
++  ~webVideoDecoderImpl();
++
++  void decode(const std::vector<uint8_t>& bitstream,
++              FrameSequence<T>&           video,
++              std::vector<size_t>&        videoBitDepth,
++              size_t                      layerIdx,
++              const std::string&          decoderPath,
++              const std::string&          parameters);
++
++private:
++  /**
++   * @brief Parse the video bitstream to extract width, height, bit depth, and frame count.
++   * For WebCodecs, we rely on the codec configuration string or parameters.
++   */
++  void parseBitstreamInfo(const std::vector<uint8_t>& bitstream,
++                          size_t& width,
++                          size_t& height,
++                          size_t& bitDepth,
++                          size_t& frameCount);
++
++  /**
++   * @brief Build codec configuration string from parameters or defaults.
++   */
++  std::string buildCodecConfig(const std::string& parameters) const;
++};
++
++}  // namespace vmesh
++
++#endif

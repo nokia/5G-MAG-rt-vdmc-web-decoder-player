@@ -1,0 +1,13 @@
+{
+  "name": "vdmc-decoder-sdk",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:standalone": "node build.mjs --standalone"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "three": "0.160.0"
+  }
+}

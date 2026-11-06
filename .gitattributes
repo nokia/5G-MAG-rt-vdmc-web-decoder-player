@@ -1,0 +1,2 @@
+# Keep the decoder patch byte-exact so `git apply` works on every platform.
+tm-reference/wasm_decoder.patch -text

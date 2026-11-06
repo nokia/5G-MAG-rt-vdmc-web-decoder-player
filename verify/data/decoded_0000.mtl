@@ -1,0 +1,9 @@
+newmtl material0000
+Ka 1 1 1
+Kd 1 1 1
+Ks 1 1 1
+Tr 1
+illum 2
+Ns 0.1
+map_Kd decoded_0000.png
+

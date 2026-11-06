@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<!--
+ © 2026 Nokia
+
+ Licensed under the 5G-MAG Public License (v1.0)
+-->
+
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>V-DMC Decoder — Sample App</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+
+<body>
+  <header>
+    <div>
+      <h1>V-DMC Web SDK example</h1>
+      <div class="subtitle">
+        <span id="dotDecoder" class="status-dot"></span>Decoder
+      </div>
+    </div>
+    <div class="toolbar">
+      <button id="btnPrev" disabled title="Previous frame (pauses)">&#9664;&#9664;</button>
+      <button id="btnPlayPause" disabled>&#9654; Play</button>
+      <button id="btnNext" disabled title="Next frame (pauses)">&#9654;&#9654;</button>
+      <input type="file" id="fileInput" accept=".vmesh" style="display: none;">
+      <button id="btnLoadFile">Load .vmesh&hellip;</button>
+    </div>
+  </header>
+
+  <div id="main">
+    <div class="viewport" id="viewportDecoded">
+      <div class="viewport-label">SUBDIVIDED + TEXTURED + DISPLACED</div>
+      <div id="previews">
+        <div class="preview">
+          <div class="preview-label">TEXTURE FRAME</div>
+          <canvas id="texPreview" width="128" height="128"></canvas>
+        </div>
+        <div class="preview">
+          <div class="preview-label">DISPLACEMENT FRAME</div>
+          <canvas id="dispPreview" width="128" height="128"></canvas>
+        </div>
+      </div>
+      <canvas id="canvasDecoded"></canvas>
+    </div>
+  </div>
+
+  <div id="bottomBar">
+    <div class="bottom-controls">
+      <label>
+        <input type="checkbox" id="wireframe"> wireframe
+      </label>
+      <label title="Toggle 2D texture & displacement previews (debug testing only)">
+        <input type="checkbox" id="chkPreviews" checked> previews
+      </label>
+    </div>
+    <span id="frameCounter">&mdash;</span>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    // Dev convenience: forward console output to the dev server /log endpoint so crashes
+    // are visible in the terminal. Harmless if the endpoint is absent.
+    (function () {
+      const _send = (level, args) => {
+        const msg = args.map(a => {
+          try { return (typeof a === 'object') ? JSON.stringify(a) : String(a); }
+          catch (_) { return String(a); }
+        }).join(' ');
+        fetch('/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ level, msg })
+        }).catch(() => {});
+      };
+      ['log', 'info', 'warn', 'error'].forEach(lvl => {
+        const orig = console[lvl].bind(console);
+        console[lvl] = (...args) => { orig(...args); _send(lvl, args); };
+      });
+      window.addEventListener('error', e =>
+        _send('error', [`Uncaught: ${e.message} @ ${e.filename}:${e.lineno}`]));
+      window.addEventListener('unhandledrejection', e =>
+        _send('error', [`UnhandledPromise: ${e.reason}`]));
+    })();
+  </script>
+
+  <script type="module">
+    // The standalone bundle carries its own Three.js — importing it from a CDN as well would
+    // load two independent copies into the page.
+    import { VDMCMesh, THREE, OrbitControls } from '/sdk/dist/vdmc_decoder.standalone.js';
+
+    const FOOTBALL_URL = 'football_encoded.vmesh';
+
+    // ---------------------------------------------------------------------------
+    // 1. Logger & Error Reporter
+    // ---------------------------------------------------------------------------
+    function setupLogger(logContainer) {
+      return function log(msg) {
+        const line = document.createElement('div');
+        line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logContainer.appendChild(line);
+        logContainer.scrollTop = logContainer.scrollHeight;
+        console.log(msg);
+      };
+    }
+
+    // ---------------------------------------------------------------------------
+    // 2. 3D Viewport Setup
+    // ---------------------------------------------------------------------------
+    function createViewport(canvas) {
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0f172a);
+
+      const camera = new THREE.PerspectiveCamera(50, canvas.clientWidth / canvas.clientHeight, 0.001, 1000);
+      camera.position.set(2, 2, 5);
+
+      const controls = new OrbitControls(camera, canvas);
+      controls.enableDamping = true;
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      dirLight.position.set(5, 5, 5);
+      scene.add(dirLight);
+
+      const container = new THREE.Group();
+      scene.add(container);
+
+      const handleResize = () => {
+        renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+        camera.aspect = canvas.clientWidth / canvas.clientHeight;
+        camera.updateProjectionMatrix();
+      };
+      window.addEventListener('resize', handleResize);
+      handleResize();
+
+      return { renderer, scene, camera, controls, container };
+    }
+
+    // ---------------------------------------------------------------------------
+    // 3. Camera Auto-Fit
+    // ---------------------------------------------------------------------------
+    function fitCameraToGeometry(viewport, geometry) {
+      const box = geometry.boundingBox || (geometry.computeBoundingBox(), geometry.boundingBox);
+      const center = new THREE.Vector3();
+      const size = new THREE.Vector3();
+      box.getCenter(center);
+      box.getSize(size);
+
+      const radius = Math.max(size.length() * 0.5, 1e-4);
+      const fovRad = viewport.camera.fov * (Math.PI / 180);
+      const distance = (radius / Math.sin(fovRad / 2)) * 1.3;
+
+      viewport.controls.target.copy(center);
+      viewport.camera.position.set(center.x, center.y, center.z + distance);
+      viewport.camera.near = Math.max(distance / 1000, 1e-4);
+      viewport.camera.far = distance * 1000;
+      viewport.camera.updateProjectionMatrix();
+      viewport.controls.update();
+    }
+
+    // ---------------------------------------------------------------------------
+    // 4. Debug Previews (Texture & Displacement)
+    // ---------------------------------------------------------------------------
+    function drawPreviewCanvas(targetCanvas, sourceImage, isDisplacement = false) {
+      const ctx = targetCanvas.getContext('2d');
+      ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+      if (!sourceImage) return;
+
+      ctx.imageSmoothingEnabled = false;
+
+      // Displacement luma plane Float32 array ({data, width, height})
+      if (sourceImage.data && sourceImage.width) {
+        const { width: w, height: h, data } = sourceImage;
+        const tmpCanvas = document.createElement('canvas');
+        tmpCanvas.width = w;
+        tmpCanvas.height = h;
+        const tctx = tmpCanvas.getContext('2d');
+        const imgData = tctx.createImageData(w, h);
+
+        for (let i = 0; i < w * h; i++) {
+          const gray = Math.max(0, Math.min(255, Math.round(128 + (data[i] - 0.5) * 2040)));
+          imgData.data[i * 4 + 0] = gray;
+          imgData.data[i * 4 + 1] = gray;
+          imgData.data[i * 4 + 2] = gray;
+          imgData.data[i * 4 + 3] = 255;
+        }
+        tctx.putImageData(imgData, 0, 0);
+        ctx.drawImage(tmpCanvas, 0, 0, w, h, 0, 0, targetCanvas.width, targetCanvas.height);
+        return;
+      }
+
+      ctx.drawImage(sourceImage, 0, 0, sourceImage.width, sourceImage.height, 0, 0, targetCanvas.width, targetCanvas.height);
+
+      if (isDisplacement) {
+        const imgData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+        const d = imgData.data;
+        for (let i = 0; i < d.length; i += 4) {
+          const gray = Math.max(0, Math.min(255, Math.round(128 + (d[i] - 128) * 20)));
+          d[i + 0] = gray;
+          d[i + 1] = gray;
+          d[i + 2] = gray;
+        }
+        ctx.putImageData(imgData, 0, 0);
+      }
+    }
+
+    function updateDebugPreviews(texCanvas, dispCanvas, frame, enabled) {
+      if (!enabled) return;
+      drawPreviewCanvas(texCanvas, frame.textureImage, false);
+      drawPreviewCanvas(dispCanvas, frame.displacementImage, true);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 5. UI Controls & Events Wiring
+    // ---------------------------------------------------------------------------
+    function setupUI(vdmc, viewport, log) {
+      const playBtn = document.getElementById('btnPlayPause');
+      const prevBtn = document.getElementById('btnPrev');
+      const nextBtn = document.getElementById('btnNext');
+      const frameCounter = document.getElementById('frameCounter');
+      const dotDecoder = document.getElementById('dotDecoder');
+      const wireframeBox = document.getElementById('wireframe');
+      const previewsBox = document.getElementById('chkPreviews');
+      const previewsContainer = document.getElementById('previews');
+      const fileBtn = document.getElementById('btnLoadFile');
+      const fileInput = document.getElementById('fileInput');
+
+      const texPreview = document.getElementById('texPreview');
+      const dispPreview = document.getElementById('dispPreview');
+
+      const syncPlayButtonText = () => {
+        playBtn.textContent = vdmc.playing ? '⏸ Pause' : '▶ Play';
+      };
+
+      const syncPreviewsVisibility = () => {
+        const isEnabled = previewsBox.checked;
+        vdmc.enablePreviews = isEnabled;
+        previewsContainer.style.display = isEnabled ? 'flex' : 'none';
+      };
+
+      // Transport controls
+      playBtn.addEventListener('click', () => { vdmc.togglePlay(); syncPlayButtonText(); });
+      prevBtn.addEventListener('click', () => { vdmc.stepBackward(); syncPlayButtonText(); });
+      nextBtn.addEventListener('click', () => { vdmc.stepForward(); syncPlayButtonText(); });
+
+      // Settings toggles
+      wireframeBox.addEventListener('change', () => { vdmc.wireframe = wireframeBox.checked; });
+      previewsBox.addEventListener('change', syncPreviewsVisibility);
+      syncPreviewsVisibility();
+
+      // File loader
+      fileBtn.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', async (evt) => {
+        const file = evt.target.files[0];
+        if (!file) return;
+        const bitstream = new Uint8Array(await file.arrayBuffer());
+        await vdmc.loadBitstream(bitstream, file.name);
+        fileInput.value = '';
+      });
+
+      // VDMCMesh events
+      let cameraFitted = false;
+      let autoLoaded = false;
+
+      vdmc.on('ready', () => {
+        dotDecoder.classList.add('ready');
+        if (!autoLoaded) {
+          autoLoaded = true;
+          vdmc.loadUrl(FOOTBALL_URL).catch((err) => log('Error loading stream: ' + (err.message || err)));
+        }
+      });
+
+      vdmc.on('firstframe', (frame) => {
+        if (!cameraFitted) {
+          fitCameraToGeometry(viewport, frame.baseGeometry);
+          cameraFitted = true;
+        }
+      });
+
+      vdmc.on('frame', (index, frame) => {
+        updateDebugPreviews(texPreview, dispPreview, frame, previewsBox.checked);
+      });
+
+      vdmc.player.onFrameCounter = (text) => {
+        frameCounter.textContent = text;
+      };
+
+      vdmc.on('complete', (frameCount) => {
+        const isMultiFrame = frameCount > 1;
+        playBtn.disabled = prevBtn.disabled = nextBtn.disabled = !isMultiFrame;
+        syncPlayButtonText();
+        if (vdmc.playing) log(`Auto-playing ${frameCount} frames (loop)`);
+      });
+
+      vdmc.on('mode', (mode) => log(`Render mode: ${mode}`));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Main Initialization
+    // ---------------------------------------------------------------------------
+    function init() {
+      const log = setupLogger(document.getElementById('log'));
+      const viewport = createViewport(document.getElementById('canvasDecoded'));
+
+      const vdmc = new VDMCMesh({
+        renderer: viewport.renderer,
+        ringSize: 40,
+        dispScale: 1.0,
+        onLog: log,
+        autoPlay: true,
+        loop: true,
+      });
+
+      window.vdmc = vdmc;
+      viewport.container.add(vdmc);
+
+      setupUI(vdmc, viewport, log);
+
+      function renderLoop(time) {
+        requestAnimationFrame(renderLoop);
+        vdmc.update(time);
+        viewport.controls.update();
+        viewport.renderer.render(viewport.scene, viewport.camera);
+      }
+      requestAnimationFrame(renderLoop);
+
+      log('Page initialized — V-DMC SDK sample app.');
+    }
+
+    init();
+  </script>
+</body>
+
+</html>

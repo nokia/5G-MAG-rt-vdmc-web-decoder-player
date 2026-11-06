@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<!--
+ © 2026 Nokia
+
+ Licensed under the 5G-MAG Public License (v1.0)
+-->
+
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SubdivideMesh.js — V-DMC displacement parity test</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; height: 100%; background: #14171c; color: #cdd3da;
+               font: 13px/1.5 system-ui, sans-serif; overflow: hidden; }
+  #c { position: fixed; inset: 0; display: block; }
+  #panel { position: fixed; top: 10px; left: 10px; z-index: 10; width: 320px;
+           background: rgba(20,24,30,.85); border: 1px solid #2a313b; border-radius: 8px;
+           padding: 12px 14px; backdrop-filter: blur(6px); }
+  #panel h1 { font-size: 13px; margin: 0 0 8px; color: #fff; font-weight: 600; }
+  #panel label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  #panel input[type=range] { flex: 1; }
+  #panel .val { width: 64px; text-align: right; color: #7fd0ff; font-variant-numeric: tabular-nums; }
+  #panel button { background: #283341; color: #cdd3da; border: 1px solid #3a4654;
+                  border-radius: 5px; padding: 4px 9px; cursor: pointer; }
+  #panel button:hover { background: #324050; }
+  #log { margin-top: 10px; padding-top: 8px; border-top: 1px solid #2a313b;
+         white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 11px;
+         color: #93a1ad; max-height: 200px; overflow: auto; }
+  .err { color: #ff8a8a; }
+</style>
+<!-- Import map: same specifiers SubdivideMesh.js / the SDK expect -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+  // Dev convenience: forward console output to the dev server /log endpoint so messages and
+  // crashes are visible in the terminal. Harmless if the endpoint is absent.
+  (function () {
+    const _send = (level, args) => {
+      const msg = args.map(a => {
+        try { return (typeof a === 'object') ? JSON.stringify(a) : String(a); }
+        catch (_) { return String(a); }
+      }).join(' ');
+      fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ level, msg }) }).catch(() => {});
+    };
+    ['log', 'info', 'warn', 'error'].forEach(lvl => {
+      const orig = console[lvl].bind(console);
+      console[lvl] = (...args) => { orig(...args); _send(lvl, args); };
+    });
+    addEventListener('error', e => _send('error', [`Uncaught: ${e.message} @ ${e.filename}:${e.lineno}`]));
+    addEventListener('unhandledrejection', e => _send('error', [`UnhandledPromise: ${e.reason}`]));
+  })();
+</script>
+<div id="panel">
+  <h1>SubdivideMesh.js displacement parity</h1>
+  <label>disp scale
+    <input id="scale" type="range" min="0" max="2" step="0.01" value="1" />
+    <span class="val" id="scaleVal">1.00×</span>
+  </label>
+  <label>wireframe <input id="wire" type="checkbox" /></label>
+  <label>texture <input id="texToggle" type="checkbox" checked /></label>
+  <label>surface
+    <select id="mode">
+      <option value="0" selected>midpoint (flat / V-DMC)</option>
+      <option value="1">PN smooth</option>
+    </select>
+  </label>
+  <div>
+    <button id="reset">reset view</button>
+  </div>
+  <div>
+    <button id="dump">dump vertices (TF)</button>
+  </div>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { cumulativeCounts, buildCanonicalDescriptors, flattenRecipe, evalOps }
+  from '/sdk/src/subdivNumbering.mjs';
+import { captureShaderOutput } from '/verification/gpu-capture.mjs';
+import { SubdivideMesh } from '/sdk/src/SubdivideMesh.js';
+
+// ---------------------------------------------------------------- config
+// Every dataset lives in ./data/<name>/ with the same file names and a params.json carrying the
+// values the real SDK receives from the decoder via onDispParams. Pick one with ?data=<name>.
+const P = new URLSearchParams(location.search);
+const DATA = P.get('data') || 'sphere';
+const DIR = `./data/${DATA}/`;
+
+let CFG = null;
+async function loadConfig() {
+  const p = await fetch(DIR + 'params.json').then(r => {
+    if (!r.ok) throw new Error(`dataset '${DATA}' not found (HTTP ${r.status} on ${DIR}params.json)`);
+    return r.json();
+  });
+  CFG = {
+    baseObj: DIR + 'base.obj',
+    texPng:  p.hasTex ? DIR + 'tex.png' : null,
+    dispYuv: DIR + 'disp.yuv',
+    decObj:  DIR + 'dec.obj',   // decoder's reconstructed mesh (ground truth, dIdx order)
+    subdiv: p.subdiv, dispWidth: p.dispWidth, dispHeight: p.dispHeight,
+    log2BlockSize: p.log2BlockSize, geomBitDepth: p.geomBitDepth, refScale: p.refScale,
+    edgeTable: p.edgeTable || [],
+    packingMethod: p.packingMethod != null ? p.packingMethod : 1,
+  };
+  document.querySelector('#panel h1').textContent = `SubdivideMesh.js displacement parity (${DATA})`;
+}
+
+const logEl = document.getElementById('log');
+const log = (m, cls) => { const d = document.createElement('div'); if (cls) d.className = cls;
+                          d.textContent = m; logEl.appendChild(d); logEl.scrollTop = 1e9;
+                          console.log('[test]', m); };
+
+// ---------------------------------------------------------------- OBJ parse
+// Parse positions/uvs/faces preserving the canonical `v`-line vertex numbering — this is the
+// base-vertex index space the displacement video was packed against (must NOT be reordered).
+function parseObj(text) {
+  const pos = [], uv = [], faces = [], faceUv = [], uvForVert = new Map();
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('v ')) {
+      const p = t.split(/\s+/); pos.push(+p[1], +p[2], +p[3]);
+    } else if (t.startsWith('vt ')) {
+      const p = t.split(/\s+/); uv.push(+p[1], +p[2]);
+    } else if (t.startsWith('f ')) {
+      const corners = t.split(/\s+/).slice(1).map(tok => {
+        const [vi, vti] = tok.split('/').map(s => s === '' ? NaN : parseInt(s, 10));
+        return { v: vi - 1, vt: Number.isNaN(vti) ? -1 : vti - 1 };
+      });
+      // triangulate fan (base meshes are triangles, but be safe)
+      for (let k = 1; k < corners.length - 1; k++) {
+        const tri = [corners[0], corners[k], corners[k + 1]];
+        faces.push(tri.map(c => c.v));
+        faceUv.push(tri.map(c => c.vt));
+        for (const c of tri) if (c.vt >= 0 && !uvForVert.has(c.v)) uvForVert.set(c.v, c.vt);
+      }
+    }
+  }
+  const V0 = pos.length / 3;
+  const positions = new Float32Array(pos);
+  const uvs = new Float32Array(V0 * 2);
+  for (let v = 0; v < V0; v++) {
+    const vt = uvForVert.has(v) ? uvForVert.get(v) : -1;
+    if (vt >= 0) { uvs[v * 2] = uv[vt * 2]; uvs[v * 2 + 1] = uv[vt * 2 + 1]; }
+  }
+  return { positions, uvs, uvRaw: new Float32Array(uv), faces, faceUv, V0 };
+}
+
+// Build the per-triangle base-edge table (ebm) using the DECODER's exact edge numbering —
+// a port of _vdmcSubdivision.py initializeSubdiv (== C++ mesh.hpp). Edges are numbered by
+// walking each vertex's adjacent triangles in ascending triangle-index order and collecting
+// newly-seen higher-index neighbours. This is the order the displacement video is packed in;
+// an ascending-sort heuristic produces a DIFFERENT numbering and shuffles displacements among
+// edge vertices. In the production SDK this table arrives ready-made from the decoder
+// (onDispParams.edgeTable), so this reproduction is only needed for the standalone test.
+function buildEdgeTable(faces, V0) {
+  // vertexToTriangle: triangle indices per vertex, in ascending triangle order.
+  const v2t = Array.from({ length: V0 }, () => []);
+  faces.forEach((t, ti) => {
+    v2t[t[0]].push(ti);
+    if (t[1] !== t[0]) v2t[t[1]].push(ti);
+    if (t[2] !== t[0] && t[2] !== t[1]) v2t[t[2]].push(ti);
+  });
+
+  const tag = new Uint8Array(V0);
+  const adjacentVertices = (v0) => {
+    const out = [];
+    for (const ti of v2t[v0]) { const t = faces[ti]; tag[t[0]] = tag[t[1]] = tag[t[2]] = 1; }
+    tag[v0] = 0;
+    for (const ti of v2t[v0]) {
+      const t = faces[ti];
+      for (let j = 0; j < 3; j++) { const idx = t[j]; if (tag[idx]) { out.push(idx); tag[idx] = 0; } }
+    }
+    return out;
+  };
+
+  const edgeMap = new Map();
+  let counter = V0;
+  for (let v0 = 0; v0 < V0; v0++)
+    for (const v1 of adjacentVertices(v0))
+      if (v1 > v0) edgeMap.set(v0 + ',' + v1, counter++);
+  const E0 = counter - V0;
+
+  const edgeTable = new Uint32Array(faces.length * 3);
+  faces.forEach((f, t) => {
+    for (let k = 0; k < 3; k++) {
+      const a = f[k], b = f[(k + 1) % 3];
+      edgeTable[3 * t + k] = edgeMap.get(Math.min(a, b) + ',' + Math.max(a, b)) - V0; // ebm
+    }
+  });
+  return { edgeTable, E0 };
+}
+
+// ---------------------------------------------------------------- YUV displacement
+// Read the Y plane (256x64, 10-bit packed as 16-bit LE) and normalise to /1024 so that the
+// V-DMC zero level (raw 512) maps to 0.5 — which is exactly what SubdivideMesh subtracts.
+async function loadDispTexture(url, w, h) {
+  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  const y = new Uint16Array(buf.buffer, buf.byteOffset, w * h); // LE on browsers
+  const data = new Float32Array(w * h);
+  // Backward test: emulate the real browser video-decode representation on the SAME exact
+  // displacement, so DEC COMPARE isolates how much that path degrades reconstruction.
+  //   ?bits=8   requantize to 8 bits (an 8-bit canvas snapshot instead of the 10-bit float path)
+  //   ?range=tv treat the luma as limited/studio-range 10-bit ([64,940]) and expand to [0,1]
+  const bits = parseInt(P.get('bits') || '10', 10);
+  const range = P.get('range') || 'full';
+  const steps = (1 << bits) - 1;
+  for (let i = 0; i < w * h; i++) {
+    let v = (range === 'tv') ? (y[i] - 64) / (940 - 64) : y[i] / 1024;
+    if (bits < 10) v = Math.round(v * steps) / steps;
+    data[i] = v;
+  }
+  console.log(`[test] disp representation: bits=${bits} range=${range}`);
+  const tex = new THREE.DataTexture(data, w, h, THREE.RedFormat, THREE.FloatType);
+  tex.internalFormat = 'R32F';
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// ?browserdisp — build the displacement texture from the browser's WebCodecs-decoded values
+// (browser_disp.json, 8-bit R per pixel) instead of the native YUV. Isolates whether the
+// browser displacement VALUES (fed into this proven-correct pipeline) cause the reconstruction error.
+async function loadBrowserDispTexture() {
+  const b = await fetch(DIR + 'browser_disp.json').then(r => r.json());
+  const n = b.w * b.h, data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = b.bits === 8 ? b.r[i] / 255 : b.r[i];
+  console.log(`[test] browser disp texture: ${b.w}x${b.h} (${b.bits}-bit)`);
+  const tex = new THREE.DataTexture(data, b.w, b.h, THREE.RedFormat, THREE.FloatType);
+  tex.internalFormat = 'R32F';
+  tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false; tex.needsUpdate = true;
+  return tex;
+}
+
+// ---------------------------------------------------------------- scene
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14171c);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1e5);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+let mesh = null;
+
+async function build() {
+  try {
+    log('loading base mesh, texture, displacement…');
+    const useBrowserDisp = P.has('browserdisp');
+    const [objText, dispTex, colorTex] = await Promise.all([
+      fetch(CFG.baseObj).then(r => r.text()),
+      useBrowserDisp ? loadBrowserDispTexture() : loadDispTexture(CFG.dispYuv, CFG.dispWidth, CFG.dispHeight),
+      CFG.texPng ? new THREE.TextureLoader().loadAsync(CFG.texPng) : Promise.resolve(null),
+    ]);
+    if (colorTex) colorTex.colorSpace = THREE.SRGBColorSpace;
+    if (colorTex) colorTex.flipY = true;
+    colorTexRef = colorTex;
+
+    // Decoder's reconstructed mesh — vertices are in global dIdx order (ground truth).
+    decVertsRef = await fetch(CFG.decObj).then(r => r.text())
+      .then(t => t.split('\n').filter(l => l.startsWith('v '))
+        .map(l => { const p = l.split(/\s+/); return [+p[1], +p[2], +p[3]]; }))
+      .catch(() => null);
+
+    const obj = parseObj(objText);
+    let { edgeTable, E0 } = buildEdgeTable(obj.faces, obj.V0);
+    // ?decedge — use the decoder's edgeTable (CFG.edgeTable) instead of the recomputed one, to test
+    // whether the production dp.edgeTable is what breaks the test/SDK reconstruction.
+    if (P.has('decedge') && CFG.edgeTable && CFG.edgeTable.length) {
+      const dec = Uint32Array.from(CFG.edgeTable);
+      let diff = 0; for (let i = 0; i < Math.min(dec.length, edgeTable.length); i++) if (dec[i] !== edgeTable[i]) diff++;
+      log(`decoder edgeTable: ${dec.length} entries, ${diff} differ from recomputed`, diff ? 'err' : undefined);
+      edgeTable = dec;
+    }
+    log(`base mesh: ${obj.V0} verts, ${E0} edges, ${obj.faces.length} tris`);
+
+    // Keep references for the in-browser dIdx ground-truth comparison.
+    objRef = obj; edgeTableRef = edgeTable; E0Ref = E0;
+
+    // Per-corner expanded base (mirrors VDMCMeshStream._buildBaseGeometry): positions AND UVs are
+    // per corner (seam-correct), and Cg/normals come from userData.baseData (the indexed base).
+    const nC = obj.faces.length * 3;
+    const outPos = new Float32Array(nC * 3), outUv = new Float32Array(nC * 2);
+    const bIdx = new Uint32Array(nC), bUvIdx = new Uint32Array(nC);
+    for (let f = 0, ci = 0; f < obj.faces.length; f++) for (let k = 0; k < 3; k++, ci++) {
+      const vi = obj.faces[f][k], ti = obj.faceUv[f][k];
+      outPos[ci * 3] = obj.positions[vi * 3]; outPos[ci * 3 + 1] = obj.positions[vi * 3 + 1]; outPos[ci * 3 + 2] = obj.positions[vi * 3 + 2];
+      if (ti >= 0) { outUv[ci * 2] = obj.uvRaw[ti * 2]; outUv[ci * 2 + 1] = obj.uvRaw[ti * 2 + 1]; }
+      bIdx[ci] = vi; bUvIdx[ci] = ti >= 0 ? ti : 0;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(outUv, 2));
+    geo.userData.baseData = { positions: obj.positions, indices: bIdx, uvs: obj.uvRaw, uvIndices: bUvIdx };
+
+    // dispParams — mirrors VDMCDecoder.onDispParams so SubdivideMesh takes its proper path.
+    const dispParams = {
+      edgeTable,
+      baseVertexCount: obj.V0,
+      baseEdgesCount:  E0,
+      subdivIterationCount: CFG.subdiv,
+      dispWidth:  CFG.dispWidth,
+      dispHeight: CFG.dispHeight,
+      log2BlockSize: CFG.log2BlockSize,
+      packingMethod: (CFG.packingMethod != null ? CFG.packingMethod : 1),
+      geomBitDepth:  CFG.geomBitDepth,
+      oneDimDisplacementFlag: 1,
+      iscale: new Float32Array(48).fill(CFG.refScale), // unused by shader, present for parity
+      lodCount: CFG.subdiv + 1,
+      dispDimension: 1,
+    };
+    mesh = SubdivideMesh(geo, colorTex, dispTex, CFG.subdiv, false, dispParams);
+
+    // SubdivideMesh applies: pos = surface + n * (mapDisp.r - 0.5) * dispScale * uDispUnit.
+    // Reference applies: (raw-512)*refScale, and we stored raw/1024, so the matching base
+    // multiplier is refScale*1024 / uDispUnit. The UI "disp scale" then multiplies on top.
+    const uDispUnit = mesh.material.uniforms.uDispUnit.value;
+    baseDispScale = CFG.refScale * 1024 / uDispUnit;
+    log(`uDispUnit (model radius) = ${uDispUnit.toFixed(3)}`);
+    log(`base dispScale (1.00×)   = ${baseDispScale.toExponential(4)}`);
+
+    mesh.material.uniforms.dispScale.value = baseDispScale * uiScale;
+    scene.add(mesh);
+    baseGeoRef = geo;
+    fitCamera(geo);
+    log('built ✓  — proper V-DMC displacement path active');
+    if (P.has('dump')) {
+      try { dumpVertices(); } catch (e) { log('auto-dump failed: ' + e.message, 'err'); }
+    }
+  } catch (err) {
+    log('FAILED: ' + (err && err.message || err), 'err');
+    console.error(err);
+  }
+}
+
+let baseDispScale = 0, uiScale = 1, colorTexRef = null, baseGeoRef = null;
+let objRef = null, edgeTableRef = null, E0Ref = 0, decVertsRef = null;
+
+function fitCamera(geo) {
+  // Fit to the BASE geometry, not the InstancedMesh: SubdivideMesh positions vertices in the
+  // shader (mP/mN), so the instanced mesh's own bounding volume is just the ~0..1 barycentric
+  // pattern at the origin and would aim the camera at empty space.
+  geo.computeBoundingSphere();
+  const sph = geo.boundingSphere;
+  controls.target.copy(sph.center);
+  camera.position.copy(sph.center).add(new THREE.Vector3(0, 0, sph.radius * 2.6));
+  camera.near = sph.radius / 100; camera.far = sph.radius * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+// ---------------------------------------------------------------- transform-feedback dump
+// Capture the EXACT object-space vertices the production SubdivideMesh shader produces. The
+// capture itself lives in the shared capture module, so this page, verify/ and
+// run-verification.mjs all measure the same thing through the same code.
+function dumpVertices() {
+  if (!mesh) { log('nothing built yet', 'err'); return; }
+  const auto = P.has('dump');
+  const U  = mesh.material.uniforms;
+
+  let cap;
+  try { cap = captureShaderOutput(mesh, renderer, P.has('rtt') ? { readback: true } : {}); }
+  catch (e) { log('capture failed: ' + (e && e.message || e), 'err'); console.error(e); return; }
+
+  const nVerts = cap.patternVertexCount, instCount = cap.instanceCount, total = cap.total;
+  const posOut = cap.pos, idxOut = cap.dIdx, dispOut = cap.disp;
+  log(`${cap.method}: ${nVerts} pattern verts × ${instCount} base tris = ${total} outputs`);
+
+  // ---- stats + download ----------------------------------------------------------------------
+  let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  let dLo = Infinity, dHi = -Infinity;
+  for (let i = 0; i < total; i++) {
+    for (let k = 0; k < 3; k++) { const v = posOut[i*3+k]; if (v < lo[k]) lo[k]=v; if (v > hi[k]) hi[k]=v; }
+    const d = idxOut[i]; if (d < dLo) dLo = d; if (d > dHi) dHi = d;
+  }
+  log(`pos bbox  min=[${lo.map(n=>n.toFixed(1))}]  max=[${hi.map(n=>n.toFixed(1))}]`);
+  log(`dIdx range  ${dLo} .. ${dHi}`);
+  log('first 6 outputs (tbm, vi, dIdx, pos):');
+  for (let i = 0; i < 6; i++)
+    log(`  t${Math.floor(i/nVerts)} v${i%nVerts}  dIdx=${idxOut[i]}  (${posOut[i*3].toFixed(1)}, ${posOut[i*3+1].toFixed(1)}, ${posOut[i*3+2].toFixed(1)})`);
+
+  // ---- definitive verification: GPU dIdx vs proven JS ground truth (evalOps) ----------------
+  if (objRef && edgeTableRef) {
+    const counts = cumulativeCounts(objRef.V0, E0Ref, objRef.faces.length, CFG.subdiv);
+    const descriptors = buildCanonicalDescriptors(CFG.subdiv);
+    const opLists = descriptors.map(d => flattenRecipe(d.recipe));
+    const ebm3 = [];
+    for (let t = 0; t < objRef.faces.length; t++)
+      ebm3.push([edgeTableRef[3*t], edgeTableRef[3*t+1], edgeTableRef[3*t+2]]);
+    let mism = 0, firstBad = null;
+    for (let i = 0; i < idxOut.length; i++) {
+      const tbm = Math.floor(i / nVerts), v = i % nVerts;
+      const want = evalOps(opLists[v], { c: objRef.faces[tbm], ebm: ebm3[tbm], tbm }, counts);
+      if (idxOut[i] !== want) { mism++; if (!firstBad) firstBad = { i, tbm, v, gpu: idxOut[i], want }; }
+    }
+    if (mism === 0) log(`dIdx VERIFY: PASS - all ${idxOut.length} GPU indices match JS ground truth`);
+    else log(`dIdx VERIFY: FAIL - ${mism}/${idxOut.length} mismatch; first t${firstBad.tbm} v${firstBad.v} gpu=${firstBad.gpu} want=${firstBad.want}`, 'err');
+  }
+
+  // ---- smoothness check: radius spread about the model centre (lower std = smoother) --------
+  {
+    const cx = (lo[0]+hi[0])/2, cy = (lo[1]+hi[1])/2, cz = (lo[2]+hi[2])/2;
+    let s = 0, s2 = 0;
+    for (let i = 0; i < total; i++) {
+      const r = Math.hypot(posOut[i*3]-cx, posOut[i*3+1]-cy, posOut[i*3+2]-cz);
+      s += r; s2 += r*r;
+    }
+    const mean = s/total, std = Math.sqrt(Math.max(0, s2/total - mean*mean));
+    log(`radius mean=${mean.toFixed(2)} std=${std.toFixed(2)} (low std = smooth sphere)`);
+  }
+
+  // ---- compare displaced GPU vertices against the decoder's reconstructed mesh --------------
+  // dec.obj vertices are in global dIdx order, so output i (with index dIdx) must equal
+  // dec[dIdx]. This is the true end-to-end check: base mesh + subdivision + displacement.
+  if (decVertsRef) {
+    const uiScaleNow = U.dispScale.value / (baseDispScale || 1);
+    if (Math.abs(uiScaleNow - 1) > 1e-3)
+      log(`note: disp scale is ${uiScaleNow.toFixed(2)}× — set it to 1.00× for an exact match`, 'err');
+    let sumErr = 0, maxErr = 0, n = 0, worst = null;
+    for (let i = 0; i < total; i++) {
+      const d = idxOut[i];
+      if (d < 0 || d >= decVertsRef.length) continue;
+      const r = decVertsRef[d];
+      const e = Math.hypot(posOut[i*3]-r[0], posOut[i*3+1]-r[1], posOut[i*3+2]-r[2]);
+      sumErr += e; n++;
+      if (e > maxErr) { maxErr = e; worst = { i, d, gpu: [posOut[i*3], posOut[i*3+1], posOut[i*3+2]], ref: r }; }
+    }
+    const meanErr = sumErr / n;
+    const diag = Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]);
+    log(`DEC COMPARE: meanErr=${meanErr.toFixed(3)} maxErr=${maxErr.toFixed(3)} (model diag=${diag.toFixed(0)}, rel=${(100*meanErr/diag).toFixed(4)}%)`);
+    if (worst) log(`  worst @dIdx=${worst.d}: gpu=(${worst.gpu.map(n=>n.toFixed(1))}) ref=(${worst.ref.map(n=>n.toFixed(1))}) gpuDisp=${dispOut[worst.i].toFixed(4)}`);
+    log(meanErr < 1.0 ? 'DEC COMPARE: PASS - matches decoder reconstruction'
+                      : 'DEC COMPARE: large error - investigate', meanErr < 1.0 ? undefined : 'err');
+  }
+
+  // Point-cloud OBJ (vertex order = tbm*nVerts + patternVertex).
+  let obj = `# SubdivideMesh.js TF dump — ${total} verts (nVerts=${nVerts}, instances=${instCount})\n`;
+  obj += `# dispScale=${U.dispScale.value} uSubdivMode=${U.uSubdivMode.value}\n`;
+  for (let i = 0; i < total; i++) obj += `v ${posOut[i*3]} ${posOut[i*3+1]} ${posOut[i*3+2]}\n`;
+
+  if (auto) { log('auto-dump: stats only (no file written)'); return; }
+  download('subdivmesh_tf_dump.obj', obj);
+  // JSON with dIdx for index-mapping comparison against the Python reference.
+  download('subdivmesh_tf_dump.json', JSON.stringify({
+    nVerts, instCount, dispScale: U.dispScale.value, uSubdivMode: U.uSubdivMode.value,
+    dIdx: Array.from(idxOut), pos: Array.from(posOut),
+  }));
+  log('downloaded subdivmesh_tf_dump.obj + .json ✓');
+}
+
+function download(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---------------------------------------------------------------- UI
+const scaleEl = document.getElementById('scale');
+const scaleVal = document.getElementById('scaleVal');
+scaleEl.oninput = () => {
+  uiScale = +scaleEl.value;
+  scaleVal.textContent = uiScale.toFixed(2) + '×';
+  if (mesh) mesh.material.uniforms.dispScale.value = baseDispScale * uiScale;
+};
+document.getElementById('wire').onchange = e => { if (mesh) mesh.material.wireframe = e.target.checked; };
+document.getElementById('texToggle').onchange = e => {
+  if (mesh) mesh.material.uniforms.mapTexture.value = e.target.checked ? colorTexRef : null;
+};
+document.getElementById('mode').onchange = e => {
+  if (mesh) mesh.material.uniforms.uSubdivMode.value = +e.target.value;
+};
+document.getElementById('reset').onclick = () => { if (baseGeoRef) fitCamera(baseGeoRef); };
+document.getElementById('dump').onclick = () => {
+  try { dumpVertices(); }
+  catch (err) { log('TF dump failed: ' + (err && err.message || err), 'err'); console.error(err); }
+};
+
+function loop() {
+  requestAnimationFrame(loop);
+  controls.update();
+  renderer.render(scene, camera);
+}
+loop();
+try { await loadConfig(); build(); }
+catch (err) { log('FAILED: ' + (err && err.message || err), 'err'); console.error(err); }
+</script>
+</body>
+</html>

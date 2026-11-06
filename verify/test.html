@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<!--
+ © 2026 Nokia
+
+ Licensed under the 5G-MAG Public License (v1.0)
+-->
+
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>V-DMC GPU reconstruction check — SDK vs PC decoder</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; height: 100%; background: #14171c; color: #cdd3da;
+               font: 13px/1.5 system-ui, sans-serif; overflow: hidden; }
+  #c { position: fixed; inset: 0; display: block; }
+  #panel { position: fixed; top: 10px; left: 10px; z-index: 10; width: 340px;
+           background: rgba(20,24,30,.85); border: 1px solid #2a313b; border-radius: 8px;
+           padding: 12px 14px; backdrop-filter: blur(6px); }
+  #panel h1 { font-size: 13px; margin: 0 0 8px; color: #fff; font-weight: 600; }
+  #panel label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  #panel button { background: #283341; color: #cdd3da; border: 1px solid #3a4654;
+                  border-radius: 5px; padding: 4px 9px; cursor: pointer; }
+  #panel button:hover { background: #324050; }
+  #log { margin-top: 10px; padding-top: 8px; border-top: 1px solid #2a313b;
+         white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 11px;
+         color: #93a1ad; max-height: 55vh; overflow: auto; }
+  .err { color: #ff8a8a; }
+  .ok  { color: #86efac; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+  // Forward only uncaught errors to the dev server /log endpoint (crash visibility on mobile).
+  // Per-line results are posted directly by log() below — we deliberately do NOT wrap console,
+  // because the SDK/decoder emit hundreds of per-frame lines and a fetch each would dominate.
+  (function () {
+    const send = (msg) => fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                          body: JSON.stringify({ level: 'error', msg }) }).catch(() => {});
+    addEventListener('error', e => send(`Uncaught: ${e.message} @ ${e.filename}:${e.lineno}`));
+    addEventListener('unhandledrejection', e => send(`UnhandledPromise: ${e.reason}`));
+    window.__log2server = (msg) => fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                   body: JSON.stringify({ level: 'log', msg }) }).catch(() => {});
+  })();
+</script>
+<div id="panel">
+  <h1>GPU reconstruction check — SDK vs PC decoder</h1>
+  <label>wireframe <input id="wire" type="checkbox" /></label>
+  <div>
+    <button id="reset">reset view</button>
+    <button id="dump">compare (capture GPU)</button>
+  </div>
+  <div id="log"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { VDMCMeshStream } from '/sdk/src/VDMCMeshStream.js';
+import { captureShaderOutput } from '/verification/gpu-capture.mjs';
+
+const P = new URLSearchParams(location.search);
+const VMESH_URL = P.get('vmesh') || '/verify/data/mesh.vmesh';
+const DEC_OBJ_URL = P.get('dec') || '/verify/data/decoded_0000.obj';
+
+const logEl = document.getElementById('log');
+const PLAT = /Android/i.test(navigator.userAgent) ? 'MOBILE'
+           : /Windows|Macintosh|Linux/i.test(navigator.userAgent) ? 'DESKTOP' : 'OTHER';
+const log = (m, cls) => { const d = document.createElement('div'); if (cls) d.className = cls;
+                          d.textContent = m; logEl.appendChild(d); logEl.scrollTop = 1e9;
+                          console.log('[verify]', m); window.__log2server?.(`[verify:${PLAT}] ` + m); };
+
+// ---------------------------------------------------------------- scene
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14171c);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1e6);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.2));
+
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+let mesh = null, baseGeoRef = null, decVertsRef = null;
+
+function fitCamera(geo) {
+  // Fit to the BASE geometry: SubdivideMesh positions vertices in the shader (mP/mN), so the
+  // InstancedMesh's own bounding volume is just the barycentric pattern near the origin.
+  geo.computeBoundingSphere();
+  const sph = geo.boundingSphere;
+  controls.target.copy(sph.center);
+  camera.position.copy(sph.center).add(new THREE.Vector3(0, 0, sph.radius * 2.6));
+  camera.near = sph.radius / 100; camera.far = sph.radius * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+// ---------------------------------------------------------------- load
+// GPU path: the SDK decodes the .vmesh and emits a ready-to-render (subdivided + displaced) mesh
+// for each frame. We keep frame 0. No JS/CPU reconstruction happens here — the SDK owns it.
+async function build() {
+  try {
+    log(`PC ground truth: ${DEC_OBJ_URL}`);
+    decVertsRef = await fetch(DEC_OBJ_URL).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
+      .then(t => t.split('\n').filter(l => l.startsWith('v '))
+        .map(l => { const p = l.split(/\s+/); return [+p[1], +p[2], +p[3]]; }));
+    log(`  ${decVertsRef.length} decoder vertices (dIdx order)`);
+
+    log(`GPU path: SDK decoding ${VMESH_URL} …`);
+    const stream = new VDMCMeshStream({ dispScale: 1.0, renderer, onLog: (m) => { console.log('[sdk]', m); window.__log2server?.('[sdk] ' + m); } });
+
+    // Grab frame 0's mesh — the first frame the SDK emits (lowest frameId). Load only AFTER the
+    // decoder worker signals ready, otherwise the decode message races ahead of the worker.
+    const frame0 = await new Promise((resolve, reject) => {
+      let done = false;
+      stream.onFrame = (frame) => { if (!done) { done = true; resolve(frame); } };
+      stream.onComplete = () => { if (!done) reject(new Error('stream completed with no frames')); };
+      stream.onReady = () => stream.loadUrl(VMESH_URL).catch(reject);
+    });
+
+    mesh = frame0.mesh;
+    baseGeoRef = frame0.baseGeometry;
+    scene.add(mesh);
+    fitCamera(baseGeoRef);
+    const u = mesh.material.uniforms;
+    log(`SDK frame 0: dispScale=${u.dispScale.value.toExponential(4)} uDispUnit=${u.uDispUnit.value.toFixed(3)} ` +
+        `properDisp=${u.uUseProperDisp ? u.uUseProperDisp.value : '?'}`);
+    log('built ✓ — SDK GPU mesh active', 'ok');
+
+    if (P.has('dump') || PLAT === 'MOBILE') {
+      // Let the SDK's textures upload (needs a render) before the capture.
+      setTimeout(() => {
+        renderer.render(scene, camera);
+        try { dumpVertices(); } catch (e) { log('auto-compare failed: ' + e.message, 'err'); console.error(e); }
+      }, 500);
+    }
+  } catch (err) {
+    log('FAILED: ' + (err && err.message || err), 'err');
+    console.error(err);
+  }
+}
+
+// ---------------------------------------------------------------- shader capture
+// Capture the EXACT object-space vertices the production SubdivideMesh shader produces. The
+// capture lives in the shared capture module (verification/gpu-capture.mjs), which reuses the
+// SDK's own vertex shader source and binds the SDK's already-uploaded GPU displacement texture —
+// no readback, no re-upload, no reimplementation drift. The result is directly comparable to the
+// PC decoder's OBJ (same object space, global dIdx order).
+function dumpVertices() {
+  if (!mesh) { log('nothing built yet', 'err'); return; }
+
+  // Transform feedback writes nothing on Mali (desktop/ANGLE and Adreno are fine), so mobile and
+  // `?rtt` take the module's portable RGBA8 readback path instead.
+  const useRtt = P.has('rtt') || PLAT === 'MOBILE';
+
+  let cap;
+  try { cap = captureShaderOutput(mesh, renderer, { readback: useRtt }); }
+  catch (e) { log('capture failed: ' + (e && e.message || e), 'err'); console.error(e); return; }
+
+  const nVerts = cap.patternVertexCount, instCount = cap.instanceCount, total = cap.total;
+  const posOut = cap.pos, idxOut = cap.dIdx;
+  log(`capture (${cap.method}): ${nVerts} pattern verts × ${instCount} base tris = ${total} outputs`);
+
+  // ---- stats ---------------------------------------------------------------------------------
+  let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  let dLo = Infinity, dHi = -Infinity;
+  for (let i = 0; i < total; i++) {
+    for (let k = 0; k < 3; k++) { const v = posOut[i*3+k]; if (v < lo[k]) lo[k]=v; if (v > hi[k]) hi[k]=v; }
+    const d = idxOut[i]; if (d < dLo) dLo = d; if (d > dHi) dHi = d;
+  }
+  log(`pos bbox  min=[${lo.map(n=>n.toFixed(2))}]  max=[${hi.map(n=>n.toFixed(2))}]`);
+  log(`dIdx range  ${dLo} .. ${dHi}`);
+
+  // ---- compare displaced GPU vertices vs the PC decoder's reconstructed mesh -----------------
+  // decoded_0000.obj vertices are in global dIdx order, so GPU output i (index dIdx) must equal
+  // dec[dIdx]. This is the full end-to-end check: base + subdivision + displacement, all vertices.
+  if (!decVertsRef) { log('no decoder OBJ loaded', 'err'); return; }
+  const diag = Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]);
+  const seen = new Uint8Array(decVertsRef.length);
+  let sumErr = 0, maxErr = 0, n = 0, oob = 0, worst = null;
+  const TOL = diag * 1e-3;      // 0.1% of the model diagonal
+  let within = 0;
+  for (let i = 0; i < total; i++) {
+    const d = idxOut[i];
+    if (d < 0 || d >= decVertsRef.length) { oob++; continue; }
+    seen[d] = 1;
+    const r = decVertsRef[d];
+    const e = Math.hypot(posOut[i*3]-r[0], posOut[i*3+1]-r[1], posOut[i*3+2]-r[2]);
+    sumErr += e; n++;
+    if (e <= TOL) within++;
+    if (e > maxErr) { maxErr = e; worst = { d, gpu: [posOut[i*3], posOut[i*3+1], posOut[i*3+2]], ref: r }; }
+  }
+  let covered = 0; for (let i = 0; i < seen.length; i++) covered += seen[i];
+  const meanErr = sumErr / n;
+  log(`compared ${n} GPU outputs against ${decVertsRef.length} decoder vertices (covered ${covered}/${decVertsRef.length})`);
+  if (oob) log(`  ${oob} outputs had out-of-range dIdx`, 'err');
+  log(`ERROR  mean=${meanErr.toFixed(4)}  max=${maxErr.toFixed(4)}  (model diag=${diag.toFixed(1)}, rel mean=${(100*meanErr/diag).toFixed(4)}%)`);
+  log(`within 0.1% diag: ${within}/${n} (${(100*within/n).toFixed(2)}%)`);
+  if (worst) log(`  worst @dIdx=${worst.d}: gpu=(${worst.gpu.map(v=>v.toFixed(2))}) ref=(${worst.ref.map(v=>v.toFixed(2))})`);
+  const pass = covered === decVertsRef.length && meanErr < TOL;
+  log(pass ? 'RESULT: PASS — GPU reconstruction matches PC decoder'
+           : 'RESULT: mismatch — investigate', pass ? 'ok' : 'err');
+}
+
+// ---------------------------------------------------------------- UI
+document.getElementById('wire').onchange = e => { if (mesh) mesh.material.wireframe = e.target.checked; };
+document.getElementById('reset').onclick = () => { if (baseGeoRef) fitCamera(baseGeoRef); };
+document.getElementById('dump').onclick = () => {
+  try { dumpVertices(); } catch (err) { log('capture failed: ' + (err && err.message || err), 'err'); console.error(err); }
+};
+
+function loop() {
+  requestAnimationFrame(loop);
+  controls.update();
+  renderer.render(scene, camera);
+}
+loop();
+build();
+</script>
+</body>
+</html>

@@ -1,0 +1,242 @@
+/**
+ * © 2026 Nokia
+ *
+ * Licensed under the 5G-MAG Public License (v1.0)
+ */
+
+/* ============================================================
+   Nokia-aligned UI styling
+   Derived from nokia_ui_design_reference.md:
+   - Light, radically-simple enterprise surfaces
+   - NokiaBlue reserved for primary actions / emphasis
+   - Nokia Pure typography (with neutral sans-serif fallback)
+   - 8px spacing rhythm, generous white space, high contrast
+   ============================================================ */
+
+:root {
+  /* Core neutrals + primary brand blue (Nokia working palette) */
+  --nokia-blue: #124191;
+  --nokia-blue-black: #001135;
+  --white: #ffffff;
+  --gray-1: #edf2f5;
+  --gray-2: #bec8d2;
+  --gray-3: #98a2ae;
+  --gray-4: #4d5766;
+  --gray-5: #273142;
+  --off-white-1: #f0efeb;
+
+  /* Semantic accents (used sparingly) */
+  --strong-green: #4bdd33;
+  --strong-red: #ff3154;
+  --app-blue-1: #00c9ff;
+
+  /* Roles */
+  --bg: var(--gray-1);
+  --surface: var(--white);
+  --surface-alt: var(--off-white-1);
+  --border: var(--gray-2);
+  --text: var(--gray-5);
+  --text-secondary: var(--gray-4);
+  --accent: var(--nokia-blue);
+
+  /* 8px spacing rhythm */
+  --space-1: 8px;
+  --space-2: 16px;
+  --space-3: 24px;
+  --space-4: 32px;
+}
+
+body {
+  /* Nokia Pure when available; neutral sans-serif fallback otherwise */
+  font-family: 'Nokia Pure Text', 'Nokia Pure', system-ui, -apple-system,
+    'Segoe UI', Roboto, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+header {
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+h1 {
+  margin: 0;
+  /* Headline styles per Nokia Pure Headline Light guidance */
+  font-family: 'Nokia Pure Headline', 'Nokia Pure', system-ui, sans-serif;
+  font-size: 1.5rem;
+  font-weight: 300;
+  color: var(--nokia-blue-black);
+  letter-spacing: 0.01em;
+}
+
+.subtitle {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: var(--space-1);
+}
+
+.toolbar {
+  display: flex;
+  gap: var(--space-1);
+  align-items: center;
+}
+
+button {
+  padding: 0.5rem 1rem;
+  background: var(--accent);
+  color: var(--white);
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.875rem;
+  transition: background-color 0.2s ease;
+}
+
+button:hover {
+  background: #0e3576;
+}
+
+button:disabled {
+  background: var(--gray-3);
+  cursor: not-allowed;
+}
+
+.toolbar label,
+.bottom-controls label {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+
+#bottomBar {
+  padding: var(--space-1) var(--space-4);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.bottom-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+#frameCounter {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+#main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1px;
+  background: var(--border);
+}
+
+.viewport {
+  position: relative;
+  background: var(--gray-5);
+}
+
+.viewport-label {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  background: var(--nokia-blue-black);
+  color: var(--white);
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  z-index: 10;
+}
+
+#log {
+  height: 150px;
+  background: var(--surface-alt);
+  color: var(--text);
+  padding: var(--space-2);
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 0.75rem;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+#previews {
+  position: absolute;
+  top: 52px;
+  left: var(--space-2);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  pointer-events: none;
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  background: var(--nokia-blue-black);
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.preview-label {
+  font-size: 0.7rem;
+  color: var(--white);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.preview canvas {
+  width: 128px;
+  height: 128px;
+  image-rendering: pixelated;
+  background: var(--gray-5);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  background: var(--gray-3);
+}
+
+.status-dot.ready {
+  /* Semantic status color, used only to signal readiness */
+  background: var(--strong-green);
+}

@@ -1,0 +1,13 @@
+{
+  "name": "vdmc-verification",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Single-file verification: encode.exe -> decode.exe -> web SDK decode -> compare vs rec.obj",
+  "scripts": {
+    "test": "node run-verification.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.47.0"
+  }
+}
